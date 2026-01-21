@@ -1,0 +1,108 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2867
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fmodern\fcharset0 Courier;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww16860\viewh12760\viewkind0
+\deftab720
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\fs28 \cf0 \expnd0\expndtw0\kerning0
+# \uc0\u55357 \u56522  Virtualization Sizing Calculator (v2.0)\
+\
+**Authors:** Adam Marcum & Gemini  \
+**Version:** 2.0  \
+\
+A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs complex sizing math (N+1, Growth, RAM/CPU constraints), and generates professional HTML executive summaries.\
+\
+---\
+\
+## \uc0\u55357 \u56960  Quick Start (For Users)\
+\
+**No coding knowledge required.** Follow these steps to run the tool on your Mac or Windows PC.\
+\
+1.  **Download the Tool:**\
+    * Click the green **<> Code** button above.\
+    * Select **Download ZIP**.\
+    * **Extract/Unzip** the folder to your computer (e.g., in your Documents or Downloads folder).\
+\
+2.  **Launch:**\
+    * **Windows:** Double-click `Run_on_Windows.bat`.\
+    * **Mac:** Double-click `Run_on_Mac.command`.\
+        * *Note for Mac Users:* If it says "permission denied," right-click the file and select Open, or check your Security settings.\
+\
+3.  **Use:**\
+    * The tool will automatically install necessary components (first run only) and open in your web browser.\
+    * Upload your **RVTools.xlsx** OR **Live Optics.xlsx** file to begin.\
+\
+---\
+\
+## \uc0\u55357 \u56507  Developer Start (Manual Method)\
+\
+If you prefer using the command line or modifying the code:\
+\
+**Prerequisites:** Python 3.8+\
+\
+1.  **Install Dependencies:**\
+    ```bash\
+    pip install -r requirements.txt\
+    ```\
+\
+2.  **Run the App:**\
+    ```bash\
+    streamlit run sizing_app.py\
+    ```\
+\
+---\
+\
+## \uc0\u55357 \u56541  About the Project\
+\
+This tool automates the tedious Excel math required to size VMware environments. It acts as a "Single Pane of Glass" for sizing decisions, allowing Architects to switch between allocation-based safety and performance-based consolidation.\
+\
+**What's New in Version 2.0:**\
+* **Dual-Parser Engine:** Automatically detects and parses both RVTools and Live Optics files.\
+* **Performance Sizing:** Calculate host requirements based on **Peak GHz**, **Average**, or **95th Percentile** consumption (Live Optics only).\
+* **Licensing Engine:** Calculates VMware Core-based licensing requirements (Legacy vs. Future).\
+* **Multi-File Support:** Upload multiple reports and switch between them dynamically.\
+\
+## \uc0\u10024  Key Features\
+\
+### 1. Universal Data Ingestion\
+* **RVTools Mode:** Sizes based on *Entitlement* (Allocated vCPU/vRAM). Best for conservative sizing.\
+* **Live Optics Mode:** Sizes based on *Consumption* (Used GHz/Active RAM). Best for consolidation or aggressive sizing.\
+\
+### 2. Sizing Logic\
+* **Constraint Analysis:** Automatically determines if the cluster is **CPU Bound** or **Memory Bound**.\
+* **HA & Growth:** Inputs for N+X redundancy and annual growth projections.\
+* **Overhead Awareness:** Adjustable buffers for Hypervisor CPU and RAM overhead (Default: 10%).\
+\
+### 3. Architecture & Storage\
+* **NUMA Analysis:** Checks if large VMs exceed the physical NUMA boundaries of the target hardware.\
+* **Storage Intelligence:** Distinguishes between VMDK Provisioning (Allocation) and Raw Infrastructure capacity.\
+\
+### 4. Professional Reporting\
+* Exports a branded HTML report containing:\
+    * Executive Recommendation (Host Count).\
+    * Supply vs. Demand Analysis.\
+    * Licensing Impact Analysis.\
+    * Performance insights (Allocation vs. Consumption gap).\
+\
+## \uc0\u55357 \u56514  Repository Structure\
+\
+* `sizing_app.py`: The main application code (The Brains).\
+* `requirements.txt`: List of required Python libraries (The Instructions).\
+* `Run_on_Windows.bat`: Launcher script for Windows users.\
+* `Run_on_Mac.command`: Launcher script for macOS users.\
+\
+## \uc0\u55357 \u57056  Configuration Options\
+\
+The Sidebar allows you to tweak the sizing dynamically:\
+\
+* **Target Hardware:** Sockets, Cores per Socket, and RAM per Host.\
+* **Constraints:**\
+    * **Max vCPU:pCPU Ratio:** Design limit for allocation sizing (Default: 5:1).\
+    * **Live Optics Basis:** Toggle between Peak, Average, or 95th Percentile sizing.\
+* **Scope:** Filter by specific Clusters or exclude powered-off VMs.\
+\
+## \uc0\u55357 \u56540  License\
+\
+This project is open for internal use and modification.}
