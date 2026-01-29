@@ -32,18 +32,25 @@ def promote_header(df, keywords):
         row_str = " ".join(df.iloc[i].astype(str).fillna('').values).lower()
         if all(k.lower() in row_str for k in keywords):
             df.columns = df.iloc[i]
-            df.columns = df.columns.fillna('').astype(str) 
+            # Force all columns to strings to prevent NaN header crashes
+            df.columns = df.columns.fillna('').astype(str).str.strip()
             df = df[i+1:].reset_index(drop=True)
             return df
     # Fallback
     df.columns = df.iloc[0]
-    df.columns = df.columns.fillna('').astype(str)
+    df.columns = df.columns.fillna('').astype(str).str.strip()
     df = df[1:].reset_index(drop=True)
     return df
 
 def get_col(df, keyword):
-    """Finds a column name containing the keyword (case-insensitive)."""
+    """Finds a column name: Prioritizes EXACT match, then falls back to PARTIAL match."""
     if df is None or df.empty: return None
+    
+    # 1. Exact Match (Case Insensitive)
+    exact = next((c for c in df.columns if c.lower() == keyword.lower()), None)
+    if exact: return exact
+    
+    # 2. Partial Match (Case Insensitive)
     return next((c for c in df.columns if keyword.lower() in c.lower()), None)
 
 def safe_sum(df, keyword):
@@ -53,14 +60,22 @@ def safe_sum(df, keyword):
 
 def get_rvtools_tb(df, base):
     """Smart unit finder for RVTools."""
+    # Check for "Provisioned MiB" (Standard) and "Provisioned (MiB)" (Legacy)
+    val = safe_sum(df, f"{base} MiB")
+    if val > 0: return val / 1048576
+    
     val = safe_sum(df, f"{base} (MiB)")
     if val > 0: return val / 1048576
+    
     val = safe_sum(df, f"{base} MB")
     if val > 0: return val / 1048576
+    
     val = safe_sum(df, f"{base} (GiB)")
     if val > 0: return val / 1024
+    
     val = safe_sum(df, f"{base} GB")
     if val > 0: return val / 1024
+    
     return safe_sum(df, f"{base} TB")
 
 def calc_license_cores(sockets, cores_per_socket):
@@ -275,21 +290,31 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     # Helper: Filter a DF by the LIST of selected clusters
     def apply_filter(df, col_c, col_p):
         if df is None: return None
+        
+        # 1. Filter by Cluster (Multi-Select)
         if col_c and selected_clusters:
-            c_name = get_col(df, col_c)
-            if c_name: 
-                # Use .isin() for multi-select filtering
-                df = df[df[c_name].isin(selected_clusters)]
+            # Check for "All Clusters" wildcard to bypass filtering
+            if "All Clusters" not in selected_clusters:
+                c_name = get_col(df, col_c)
+                if c_name: 
+                    # Fill NaNs with "Unclustered" to match selection
+                    df[c_name] = df[c_name].fillna("Unclustered")
+                    df = df[df[c_name].isin(selected_clusters)]
+        
+        # 2. Filter by Power State
         if col_p and not include_off:
             p_name = get_col(df, col_p)
             if p_name: df = df[df[p_name].astype(str).str.contains('poweredOn', case=False, na=False)]
+        
         return df
 
     # 1. VM Processing
     df_vm = None
     if source_type == "RVTools":
-        df_vm = promote_header(sheets['vInfo'], ["VM", "Powerstate"])
+        # Scan for "VM" and "Host" to correctly identify header
+        df_vm = promote_header(sheets['vInfo'], ["VM", "Host"])
         df_vm = apply_filter(df_vm, "Cluster", "Powerstate")
+        
         db['tot_vcpu'] = safe_sum(df_vm, 'CPUs')
         db['tot_ram'] = safe_sum(df_vm, 'Memory') / 1024
         db['vinfo_prov'] = get_rvtools_tb(df_vm, 'Provisioned')
@@ -298,6 +323,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     elif source_type == "LiveOptics":
         df_vm = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
         df_vm = apply_filter(df_vm, "Cluster", "Power State")
+        
         db['tot_vcpu'] = safe_sum(df_vm, 'Virtual CPU')
         db['tot_ram'] = safe_sum(df_vm, 'Provisioned Memory') / 1024
         db['vinfo_prov'] = safe_sum(df_vm, 'Virtual Disk Size') / 1048576
@@ -305,6 +331,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
 
     if df_vm is not None:
         db['tot_vms'] = len(df_vm)
+        # Find Max VM
         c_col = get_col(df_vm, 'CPU')
         m_col = get_col(df_vm, 'Memory')
         n_col = get_col(df_vm, 'VM') or get_col(df_vm, 'Name')
@@ -323,9 +350,11 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     if source_type == "RVTools" and 'vHost' in sheets:
         df_h = promote_header(sheets['vHost'], ["Host", "CPU"])
         df_h = apply_filter(df_h, "Cluster", None)
+        
         cpu_col = get_col(df_h, '# CPU')
         core_col = get_col(df_h, 'Cores per CPU')
         mem_col = get_col(df_h, '# Memory')
+        
         if cpu_col and core_col:
             db['cur_cores'] = (to_float(df_h[cpu_col]) * to_float(df_h[core_col])).sum()
             if mem_col: db['cur_total_ram_gb'] = to_float(df_h[mem_col]).sum() / 1024
@@ -359,7 +388,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     if df_h is not None:
         db['cur_host_count'] = len(df_h)
 
-    # 3. vSAN Detection (Simple Flag Check in Scope)
+    # 3. vSAN Detection
     disk_tab = next((k for k in sheets.keys() if 'disks' in k.lower() and 'vm' not in k.lower()), None)
     if disk_tab:
         try:
@@ -378,7 +407,9 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     # 4. Storage Capacity (Datastores/LUNs)
     if source_type == "RVTools" and 'vDatastore' in sheets:
         df_ds = promote_header(sheets['vDatastore'], ["Name", "Capacity"])
+        # RVTools vDatastore sometimes uses "Cluster" or "Cluster name"
         df_ds = apply_filter(df_ds, 'Cluster', None)
+        
         db['ds_cap'] = get_rvtools_tb(df_ds, 'Capacity')
         db['ds_free'] = get_rvtools_tb(df_ds, 'Free')
         db['ds_used'] = db['ds_cap'] - db['ds_free']
@@ -387,7 +418,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
         df_dev = promote_header(sheets['Host Devices'], ["Device Name", "Capacity"])
         
         # Map Server Name -> Cluster to filter correctly
-        if selected_clusters and host_to_cluster:
+        if selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
             srv_col = get_col(df_dev, 'Server') or get_col(df_dev, 'Host')
             if srv_col:
                 df_dev['ClusterMap'] = df_dev[srv_col].map(host_to_cluster)
@@ -407,7 +438,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     return db
 
 # --- MAIN APP ---
-st.title(f"📊 {APP_TITLE}")
+# HEADER IS ALREADY SET IN PAGE CONFIG AT TOP
 
 # SIDEBAR START
 st.sidebar.title("⚙️ Parameters")
@@ -440,6 +471,7 @@ cust_name = st.sidebar.text_input("Customer", "Client")
 logo_url = st.sidebar.text_input("Logo URL", DEFAULT_LOGO)
 
 # MAIN BODY FILE UPLOAD
+st.title(f"📊 {APP_TITLE}")
 uploaded_files = st.file_uploader("Upload .xlsx Files", type=["xlsx"], accept_multiple_files=True)
 
 if uploaded_files:
@@ -456,7 +488,8 @@ if uploaded_files:
         df_clus = None
         if 'vInfo' in sheets:
             src_type = "RVTools"
-            df_clus = promote_header(sheets['vInfo'], ["VM", "Powerstate"])
+            # Scan for "VM" and "Host" to correctly identify header
+            df_clus = promote_header(sheets['vInfo'], ["VM", "Host"])
         elif 'VMs' in sheets:
             src_type = "LiveOptics"
             df_clus = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
@@ -466,22 +499,31 @@ if uploaded_files:
             
         st.success(f"📂 **{src_type}** Detected")
         
-        # --- CLUSTER SELECTION (In Sidebar Slot) ---
+        # --- NEW: CHECKBOX LIST SELECTION ---
+        clus_col = get_col(df_clus, "Cluster")
         selected_clusters = []
+        
         with cluster_slot.container():
             st.subheader("Cluster Scope")
-            clus_col = get_col(df_clus, "Cluster")
+            
             if clus_col:
-                all_clusters = sorted(df_clus[clus_col].dropna().unique())
-                st.caption("Select clusters to consolidate:")
-                # Create checkboxes
-                for c in all_clusters:
-                    if st.checkbox(f"{c}", value=True, key=f"chk_{c}"):
-                        selected_clusters.append(c)
+                # Get unique clusters, filling NaNs with "Unclustered"
+                all_clusters = sorted(df_clus[clus_col].fillna("Unclustered").astype(str).unique())
+                
+                if not all_clusters:
+                    st.caption("No clusters found. Using global scope.")
+                    selected_clusters = ["All Clusters"]
+                else:
+                    st.caption("Check clusters to consolidate:")
+                    for c in all_clusters:
+                        # Default Checked
+                        if st.checkbox(f"{c}", value=True, key=f"chk_{c}"):
+                            selected_clusters.append(c)
             else:
                 selected_clusters = ["All Clusters"]
-                st.info("No Cluster column found. Using global scope.")
+                st.caption("No Cluster column found. Using global scope.")
 
+        # If user unchecks everything, stop.
         if not selected_clusters:
             st.warning("⚠️ Please select at least one cluster in the sidebar.")
             st.stop()
