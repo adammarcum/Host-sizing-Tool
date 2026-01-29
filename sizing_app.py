@@ -133,19 +133,24 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
     <head>
         <title>Sizing Report - {customer_name}</title>
         <style>
-            body {{ font-family: "Segoe UI", sans-serif; max-width: 1000px; margin: auto; padding: 40px; color: #333; }}
+            body {{ font-family: "Segoe UI", sans-serif; max-width: 1000px; margin: auto; padding: 40px; color: #333; background: #fff; }}
             .header-container {{ border-bottom: 3px solid #004B87; padding-bottom: 20px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: center; }}
-            .header-text h1 {{ margin: 0; font-size: 24px; color: #000; }}
+            .header-text h1 {{ margin: 0; font-size: 24px; color: #000; text-transform: uppercase; letter-spacing: 1px; }}
             .header-logo img {{ max-height: 60px; }}
-            h2 {{ color: #004B87; border-left: 5px solid #004B87; padding-left: 10px; margin-top: 40px; }}
-            .card {{ background: #f9f9f9; padding: 20px; border-radius: 4px; border: 1px solid #eee; margin-bottom: 20px; }}
+            h2 {{ color: #004B87; border-left: 5px solid #004B87; padding-left: 10px; margin-top: 40px; text-transform: uppercase; font-size: 1.1em; }}
+            .card {{ background: #f9f9f9; padding: 20px; border-radius: 4px; border: 1px solid #eee; margin-bottom: 20px; page-break-inside: avoid; }}
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
             .metric {{ font-size: 1.6em; font-weight: bold; color: #2c3e50; margin: 5px 0; }}
-            .section-label {{ font-weight: bold; color: #004B87; text-transform: uppercase; font-size: 0.8em; display:block; margin-bottom: 5px; }}
-            table {{ width: 100%; border-collapse: collapse; }}
-            td {{ border-bottom: 1px solid #ddd; padding: 8px; }}
+            .section-label {{ font-weight: bold; color: #004B87; text-transform: uppercase; font-size: 0.8em; display:block; margin-bottom: 8px; }}
+            
+            /* FIXED TABLE STYLING */
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; table-layout: fixed; }}
+            th, td {{ border-bottom: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.9em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
+            th {{ background-color: #f1f1f1; color: #555; text-transform: uppercase; font-size: 0.8em; width: 40%; }}
+            td {{ width: 60%; }}
+            
             .lic-delta {{ font-weight: bold; color: {lic_color}; }}
-            .footer {{ margin-top:50px; text-align:center; color:#999; font-size:0.8em; }}
+            .footer {{ margin-top:50px; text-align:center; color:#999; font-size:0.8em; border-top: 1px solid #eee; padding-top: 20px; }}
         </style>
     </head>
     <body>
@@ -198,15 +203,18 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
                 <div>
                     <span class="section-label">Legacy Supply (Consolidated)</span>
                     <table>
-                        <tr><th>Hosts</th><th>Physical Cores</th><th>Total RAM</th></tr>
-                        <tr><td>{data['cur_host_count']}</td><td>{data['cur_cores']:,.0f}</td><td>{data['cur_total_ram_gb']:,.0f} GB</td></tr>
+                        <tr><th>Hosts</th><td>{data['cur_host_count']}</td></tr>
+                        <tr><th>Physical Cores</th><td>{data['cur_cores']:,.0f}</td></tr>
+                        <tr><th>Total RAM</th><td>{data['cur_total_ram_gb']:,.0f} GB</td></tr>
                     </table>
                 </div>
                 <div>
                     <span class="section-label">VM Demand</span>
                     <table>
-                        <tr><th>VMs</th><th>vCPU</th><th>vRAM</th><th>Current Ratio</th></tr>
-                        <tr><td>{data['tot_vms']}</td><td>{data['tot_vcpu']:,.0f}</td><td>{data['tot_ram']:,.0f} GB</td><td><strong>{data['cur_ratio']:.1f}:1</strong></td></tr>
+                        <tr><th>VMs</th><td>{data['tot_vms']}</td></tr>
+                        <tr><th>vCPU</th><td>{data['tot_vcpu']:,.0f}</td></tr>
+                        <tr><th>vRAM</th><td>{data['tot_ram']:,.0f} GB</td></tr>
+                        <tr><th>Current Ratio</th><td><strong>{data['cur_ratio']:.1f}:1</strong></td></tr>
                     </table>
                 </div>
             </div>
@@ -217,15 +225,15 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
             <div class="card">
                 <div class="section-label">VM Allocation (vInfo)</div>
                 <table>
-                    <tr><td>Provisioned:</td><td><strong>{data.get('vinfo_prov', 0):,.1f} TB</strong></td></tr>
-                    <tr><td>In Use:</td><td><strong>{data.get('vinfo_used', 0):,.1f} TB</strong></td></tr>
+                    <tr><th>Provisioned</th><td><strong>{data.get('vinfo_prov', 0):,.1f} TB</strong></td></tr>
+                    <tr><th>In Use</th><td><strong>{data.get('vinfo_used', 0):,.1f} TB</strong></td></tr>
                 </table>
             </div>
             <div class="card">
                 <div class="section-label">Infrastructure</div>
                 <table>
-                    <tr><td>Total Capacity:</td><td><strong>{data['ds_cap']:,.1f} TB</strong></td></tr>
-                    <tr><td>Free Space:</td><td><strong>{data['ds_free']:,.1f} TB</strong></td></tr>
+                    <tr><th>Total Capacity</th><td><strong>{data['ds_cap']:,.1f} TB</strong></td></tr>
+                    <tr><th>Free Space</th><td><strong>{data['ds_free']:,.1f} TB</strong></td></tr>
                 </table>
                 {vsan_html}
             </div>
@@ -393,6 +401,7 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
     if disk_tab:
         try:
             df_d = promote_header(sheets[disk_tab], ["Model", "Capacity"])
+            # Filter disks by selected clusters if possible (LO usually has cluster col)
             df_d = apply_filter(df_d, "Cluster", None)
             
             c_mod = get_col(df_d, 'Model')
@@ -570,6 +579,14 @@ if uploaded_files:
         
         scope_str = ", ".join(selected_clusters) if len(selected_clusters) < 4 else f"{len(selected_clusters)} Clusters Selected"
         
+        # GENERATE AND PLACE DOWNLOAD BUTTON IN SIDEBAR
+        # Dynamic Filename
+        safe_cust_name = "".join(c for c in cust_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        out_filename = f"{safe_cust_name} - Sizing Report.html"
+        
+        html = generate_html_report(rpt, scope_str, file_map[sel_file].name, cust_name, logo_url)
+        st.sidebar.download_button("Download Full Report", html, file_name=out_filename)
+
         # Dashboard
         t1, t2 = st.tabs(["📋 Executive Report", "🔍 Raw Data Analysis"])
         with t1:
@@ -655,10 +672,6 @@ if uploaded_files:
             with l3:
                 st.metric("Future w/ Growth", f"{fut_lic:,.0f} Cores", f"Net: {fut_lic - db['cur_lic_cores']:,.0f}")
             
-            # Report DL
-            html = generate_html_report(rpt, scope_str, file_map[sel_file].name, cust_name, logo_url)
-            st.download_button("Download Full Report", html, "Sizing_Report.html")
-
         with t2:
             st.write("Source Data Preview")
             st.dataframe(db.get('df_raw_vinfo'))
