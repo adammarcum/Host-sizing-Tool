@@ -2,99 +2,98 @@ import streamlit as st
 import pandas as pd
 import math
 import os
+import traceback
 from datetime import datetime
 
-# --- CONFIGURATION ---
+# --- 1. PAGE CONFIG (MUST BE FIRST) ---
 APP_TITLE = "Virtualization Sizing Calculator"
 DEFAULT_LOGO = "https://placehold.co/200x50/004B87/ffffff?text=AHEAD"
 
-# --- HELPER FUNCTIONS ---
-def safe_sum(df, col):
-    if col in df.columns:
-        return pd.to_numeric(df[col], errors='coerce').sum()
-    return 0
+st.set_page_config(
+    page_title=APP_TITLE, 
+    layout="wide", 
+    page_icon="📊"
+)
+
+# --- UTILS ---
+def to_float(series):
+    """Safely converts a series to float, handling commas and strings."""
+    if series is None: return 0.0
+    return pd.to_numeric(series.astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+
+def clean_sheet_names(sheets):
+    return {k.strip(): v for k, v in sheets.items()}
+
+def promote_header(df, keywords):
+    """Scans for a header row containing specific keywords."""
+    df = df.reset_index(drop=True)
+    # Scan first 20 rows
+    for i in range(min(20, len(df))):
+        row_str = " ".join(df.iloc[i].astype(str).fillna('').values).lower()
+        if all(k.lower() in row_str for k in keywords):
+            df.columns = df.iloc[i]
+            df.columns = df.columns.fillna('').astype(str) 
+            df = df[i+1:].reset_index(drop=True)
+            return df
+    # Fallback
+    df.columns = df.iloc[0]
+    df.columns = df.columns.fillna('').astype(str)
+    df = df[1:].reset_index(drop=True)
+    return df
+
+def get_col(df, keyword):
+    """Finds a column name containing the keyword (case-insensitive)."""
+    if df is None or df.empty: return None
+    return next((c for c in df.columns if keyword.lower() in c.lower()), None)
+
+def safe_sum(df, keyword):
+    col = get_col(df, keyword)
+    if col: return to_float(df[col]).sum()
+    return 0.0
 
 def get_rvtools_tb(df, base):
-    """RVTools Specific: Searches for {base} + Unit and normalizes to TB."""
-    if f"{base} MiB" in df.columns: return safe_sum(df, f"{base} MiB") / 1048576
-    if f"{base} MB" in df.columns: return safe_sum(df, f"{base} MB") / 1048576
-    if f"{base} TB" in df.columns: return safe_sum(df, f"{base} TB")
-    if f"{base} GB" in df.columns: return safe_sum(df, f"{base} GB") / 1024
-    return 0.0
+    """Smart unit finder for RVTools."""
+    val = safe_sum(df, f"{base} (MiB)")
+    if val > 0: return val / 1048576
+    val = safe_sum(df, f"{base} MB")
+    if val > 0: return val / 1048576
+    val = safe_sum(df, f"{base} (GiB)")
+    if val > 0: return val / 1024
+    val = safe_sum(df, f"{base} GB")
+    if val > 0: return val / 1024
+    return safe_sum(df, f"{base} TB")
 
 def calc_license_cores(sockets, cores_per_socket):
     billable_per_socket = max(cores_per_socket, 16)
     return sockets * billable_per_socket
 
-def clean_sheet_names(sheets):
-    """Strips whitespace from sheet names to prevent KeyErrors."""
-    return {k.strip(): v for k, v in sheets.items()}
-
-def generate_html_report(data, cluster_name, source_filename, customer_name, logo_url):
-    """Generates a full-fidelity HTML report."""
+# --- REPORT GENERATOR ---
+def generate_html_report(data, scope_name, source_filename, customer_name, logo_url):
     now = datetime.now().strftime("%Y-%m-%d")
-    lic_color = "#d9534f" if data['lic_diff'] > 0 else "#28a745"
-    lic_prefix = "+" if data['lic_diff'] > 0 else ""
+    lic_prefix = "+" if data.get('lic_diff', 0) > 0 else ""
+    lic_color = "#d9534f" if data.get('lic_diff', 0) > 0 else "#28a745"
 
-    # NUMA Logic
-    vm_check_html = ""
-    if data['max_vm_cpu'] > 0:
-        cpu_vm = data['name_max_cpu']
-        cpu_val = data['max_vm_cpu']
-        cpu_limit = data['tgt_numa_cores']
-        is_wide_cpu = cpu_val > cpu_limit
-        cpu_style = "color:#d9534f; font-weight:bold;" if is_wide_cpu else "color:#28a745;"
-        cpu_status = f"⚠️ Exceeds Socket ({cpu_limit})" if is_wide_cpu else "✅ Fits NUMA"
+    # NUMA Display
+    vm_check_html = "<div style='color:#666;'>No VM data found.</div>"
+    if data.get('max_vm_cpu', 0) > 0:
+        cpu_stat = "⚠️ Exceeds Socket" if data['max_vm_cpu'] > data['tgt_numa_cores'] else "✅ Fits NUMA"
+        ram_stat = "⚠️ Exceeds Socket" if data['max_vm_ram'] > data['tgt_numa_ram'] else "✅ Fits NUMA"
+        vm_check_html = f"""
+        <div style="font-size:0.9em; margin-bottom:5px;"><strong>{data['name_max_cpu']}</strong>: {data['max_vm_cpu']} vCPU ({cpu_stat})</div>
+        <div style="font-size:0.9em;"><strong>{data['name_max_ram']}</strong>: {data['max_vm_ram']:.0f} GB RAM ({ram_stat})</div>"""
 
-        ram_vm = data['name_max_ram']
-        ram_val = data['max_vm_ram']
-        ram_limit = data['tgt_numa_ram']
-        is_wide_ram = ram_val > ram_limit
-        ram_style = "color:#d9534f; font-weight:bold;" if is_wide_ram else "color:#28a745;"
-        ram_status = f"⚠️ Exceeds Socket ({ram_limit:.0f} GB)" if is_wide_ram else "✅ Fits NUMA"
+    # vSAN Note
+    vsan_html = ""
+    if data.get('vsan_detected'):
+        vsan_html = """
+        <div style="margin-top:10px; padding:8px; background:#e8f5e9; border:1px solid #c8e6c9; color:#2e7d32; border-radius:4px; font-size:0.9em;">
+            <strong>✅ vSAN Detected in Source</strong><br>
+            <i>Note: Storage capacity planning for vSAN depends on RAID policy (RAID1/5/6) and is not calculated here.</i>
+        </div>"""
 
-        if cpu_vm == ram_vm:
-            vm_check_html = f"""
-            <div style="font-size:0.9em; border-bottom:1px solid #eee; padding-bottom:5px; margin-bottom:5px;">
-                <strong>{cpu_vm}</strong> (Largest VM)
-            </div>
-            <table style="margin:0;">
-                <tr><td style="width:50%;">vCPU: <strong>{cpu_val}</strong></td><td style="{cpu_style} text-align:right;">{cpu_status}</td></tr>
-                <tr><td>RAM: <strong>{ram_val:.0f} GB</strong></td><td style="{ram_style} text-align:right;">{ram_status}</td></tr>
-            </table>
-            """
-        else:
-            vm_check_html = f"""
-            <div style="margin-bottom:10px;">
-                <div style="font-size:0.9em; font-weight:bold;">{cpu_vm} (Max vCPU)</div>
-                <div style="display:flex; justify-content:space-between; font-size:0.9em;">
-                    <span>vCPU: <strong>{cpu_val}</strong></span>
-                    <span style="{cpu_style}">{cpu_status}</span>
-                </div>
-            </div>
-            <div>
-                <div style="font-size:0.9em; font-weight:bold;">{ram_vm} (Max RAM)</div>
-                <div style="display:flex; justify-content:space-between; font-size:0.9em;">
-                    <span>RAM: <strong>{ram_val:.0f} GB</strong></span>
-                    <span style="{ram_style}">{ram_status}</span>
-                </div>
-            </div>
-            """
-    else:
-        vm_check_html = "<div style='color:#666;'>No VM data found.</div>"
-
-    # Performance HTML (Live Optics)
+    # Performance Display
     perf_html = ""
-    if data['has_perf']:
-        if data['perf_hosts_rec'] < data['hosts_now']:
-            insight_title = "💡 Consolidation Opportunity"
-            insight_color = "#28a745"
-            insight_msg = f"Actual workload ({data['lo_basis']}) is lighter than allocation. You could consolidate to <strong>{data['perf_hosts_rec']} Hosts</strong>."
-        else:
-            insight_title = "⚠️ Performance Risk"
-            insight_color = "#d9534f"
-            insight_msg = f"Actual workload ({data['lo_basis']}) demands <strong>{data['perf_hosts_rec']} Hosts</strong>, which is higher than allocation. The environment may be running hot."
-
+    if data.get('has_perf'):
         perf_html = f"""
         <h2>6. Performance Analysis (Live Optics)</h2>
         <div class="card">
@@ -103,101 +102,61 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
                 <div>
                     <div style="font-size:0.9em; color:#666;">Allocated (Entitlement)</div>
                     <div class="metric">{data['tot_vcpu']:,.0f} vCPU</div>
-                    <div style="font-size:0.8em;">Total Configured vCPUs</div>
                 </div>
                 <div>
                     <div style="font-size:0.9em; color:#666;">Consumed ({data['lo_basis']})</div>
                     <div class="metric">{data['perf_ghz_demand']:,.1f} GHz</div>
-                    <div style="font-size:0.8em;">Aggregate CPU Demand</div>
                 </div>
             </div>
-            <div style="margin-top:20px; padding-top:10px; border-top:1px solid #ddd;">
-                <div class="section-label" style="color:{insight_color};">{insight_title}</div>
-                <div style="font-size:1.1em; margin-bottom:10px;">{insight_msg}</div>
-                <div class="note-box">
-                    <strong>Basis:</strong> "Safe Sizing" guarantees 100% entitlement performance. "Performance Sizing" relies on the {data['lo_basis']} metric captured during the Live Optics window.
-                </div>
+            <div style="margin-top:10px; padding-top:10px; border-top:1px solid #ddd;">
+                <div style="font-size:1.1em; margin-bottom:10px;">Workload requires <strong>{data['perf_hosts_rec']} Hosts</strong> to satisfy demand.</div>
             </div>
-        </div>
-        """
-
-    # Storage Display
-    store_infra_html = ""
-    if data['ds_cap'] > 0:
-        store_infra_html = f"""
-        <table>
-            <tr><td>Total Capacity:</td><td><strong>{data['ds_cap']:,.1f} TB</strong></td></tr>
-            <tr><td>Total In Use:</td><td><strong>{data['ds_used']:,.1f} TB</strong></td></tr>
-            <tr><td>Free Space:</td><td><strong>{data['ds_free']:,.1f} TB</strong></td></tr>
-        </table>"""
-    else:
-        store_infra_html = "<div style='color:#999; padding:10px;'><em>Infrastructure storage data not found in source file.</em></div>"
+        </div>"""
 
     html = f"""
     <html>
     <head>
         <title>Sizing Report - {customer_name}</title>
         <style>
-            body {{ font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 1000px; margin: auto; padding: 40px; color: #333; background-color: #fff; }}
+            body {{ font-family: "Segoe UI", sans-serif; max-width: 1000px; margin: auto; padding: 40px; color: #333; }}
             .header-container {{ border-bottom: 3px solid #004B87; padding-bottom: 20px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: center; }}
-            .header-text h1 {{ color: #000; margin: 0; font-size: 24px; text-transform: uppercase; letter-spacing: 1px; }}
-            .sub-header {{ color: #666; font-size: 14px; margin-top: 5px; }}
-            .header-logo img {{ max-height: 60px; width: auto; }}
-            h2 {{ color: #004B87; margin-top: 40px; border-left: 5px solid #004B87; padding-left: 10px; text-transform: uppercase; font-size: 1.1em; page-break-after: avoid; }}
-            .card {{ background: #f9f9f9; padding: 20px; border-radius: 4px; border: 1px solid #eee; margin-bottom: 20px; page-break-inside: avoid; }}
+            .header-text h1 {{ margin: 0; font-size: 24px; color: #000; }}
+            .header-logo img {{ max-height: 60px; }}
+            h2 {{ color: #004B87; border-left: 5px solid #004B87; padding-left: 10px; margin-top: 40px; }}
+            .card {{ background: #f9f9f9; padding: 20px; border-radius: 4px; border: 1px solid #eee; margin-bottom: 20px; }}
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
             .metric {{ font-size: 1.6em; font-weight: bold; color: #2c3e50; margin: 5px 0; }}
-            .sub-metric {{ font-size: 0.9em; color: #666; }}
-            .highlight {{ background-color: #e6f3ff; border: 1px solid #b6d4fe; padding: 20px; border-radius: 8px; page-break-inside: avoid; }}
-            .section-label {{ font-weight: bold; color: #004B87; margin-bottom: 8px; display: block; text-transform: uppercase; font-size: 0.8em; }}
-            table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; }}
-            th, td {{ border-bottom: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.9em; }}
-            th {{ color: #555; text-transform: uppercase; font-size: 0.8em; background: #f1f1f1; }}
-            .note-box {{ background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 4px; font-size: 0.85em; margin-bottom: 10px; border: 1px solid #ffeeba; }}
+            .section-label {{ font-weight: bold; color: #004B87; text-transform: uppercase; font-size: 0.8em; display:block; margin-bottom: 5px; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            td {{ border-bottom: 1px solid #ddd; padding: 8px; }}
             .lic-delta {{ font-weight: bold; color: {lic_color}; }}
-            .footer {{ text-align: center; margin-top: 50px; color: #999; font-size: 0.8em; border-top: 1px solid #eee; padding-top: 20px; }}
+            .footer {{ margin-top:50px; text-align:center; color:#999; font-size:0.8em; }}
         </style>
     </head>
     <body>
         <div class="header-container">
             <div class="header-text">
                 <h1>{APP_TITLE}</h1>
-                <div class="sub-header">Prepared for <strong>{customer_name}</strong></div>
-                <div class="sub-header">Date: {now} | Scope: {cluster_name}</div>
+                <div style="color:#666; font-size:14px;">Prepared for <strong>{customer_name}</strong> | {now}</div>
+                <div style="color:#666; font-size:12px; margin-top:5px;">Scope: {scope_name}</div>
             </div>
-            <div class="header-logo">
-                <img src="{logo_url}" alt="Logo">
-            </div>
+            <div class="header-logo"><img src="{logo_url}"></div>
         </div>
         
         <h2>1. Executive Sizing Recommendation</h2>
-        <div class="grid" style="margin-bottom: 20px;">
-            <div class="highlight">
+        <div class="grid">
+            <div class="card" style="background-color: #e6f3ff; border: 1px solid #b6d4fe;">
                 <div class="section-label">Current Refresh Requirement</div>
                 <div class="metric">{data['hosts_now']} Hosts</div>
-                <div class="sub-metric">Configuration: N+{data['ha_nodes']}</div>
-                <div class="sub-metric">Efficiency: <strong>{data['ratio_now']:.1f}:1</strong> vCPU:pCPU</div>
-                
-                <div style="margin-top:20px; border-top:1px solid #b6d4fe; padding-top:10px;">
-                    <div class="sub-metric" style="color:#000;">Constraint: <strong>{data['constraint']} Bound</strong></div>
-                    <details>
-                        <summary style="cursor:pointer; color:#004B87; font-weight:bold; margin-top:10px; font-size:0.9em;">▼ View Sizing Logic</summary>
-                        <div style="background:#fff; padding:10px; border-radius:4px; margin-top:5px; font-size:0.85em; border:1px solid #ccc;">
-                            <div><strong>1. Workload:</strong> {data['tot_vcpu']:,.0f} vCPU, {data['tot_ram']:,.0f} GB RAM</div>
-                            <div><strong>2. Effective Host:</strong> {data['eff_host_cores']:.1f} Cores, {data['eff_host_ram']:.1f} GB RAM</div>
-                            <div><strong>3. Hosts Needed:</strong> CPU: {data['hosts_for_cpu']}, RAM: {data['hosts_for_ram']}</div>
-                            <div><strong>4. Constraint:</strong> {data['constraint']} -> {int(data['raw_hosts'])} active nodes</div>
-                            <div><strong>5. Final:</strong> {int(data['raw_hosts'])} + {data['ha_nodes']} HA = {data['hosts_now']} Hosts</div>
-                        </div>
-                    </details>
-                </div>
+                <div>Configuration: N+{data['ha_nodes']}</div>
+                <div>Efficiency: <strong>{data['ratio_now']:.1f}:1</strong> vCPU:pCPU</div>
+                <div style="margin-top:10px; font-size:0.9em;">Constraint: <strong>{data['constraint']} Bound</strong></div>
             </div>
-            <div class="highlight">
-                <div class="section-label">Future Requirement with Growth</div>
+            <div class="card" style="background-color: #e6f3ff; border: 1px solid #b6d4fe;">
+                <div class="section-label">Future Requirement</div>
                 <div class="metric">{data['hosts_fut']} Hosts</div>
-                <div class="sub-metric">Growth Model: {data['growth']*100:.0f}% Annually over {data['years']} Years</div>
-                <div class="sub-metric">Efficiency: <strong>{data['ratio_fut']:.1f}:1</strong> vCPU:pCPU</div>
-                <div class="sub-metric">Projected vCPU: {data['fut_vcpu']:,.0f}</div>
+                <div>Growth Model: {data['growth']*100:.0f}% Annually over {data['years']} Years</div>
+                <div>Projected vCPU: {data['fut_vcpu']:,.0f}</div>
             </div>
         </div>
 
@@ -205,16 +164,15 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
             <div class="section-label">Target Hardware Specification</div>
             <div class="grid">
                 <div>
-                    <div style="font-weight:bold; margin-bottom:5px;">Per Node Config</div>
-                    <div>{data['sockets']} Sockets &times; {data['cores']} Cores</div>
+                    <div><strong>Per Node Config</strong></div>
+                    <div>{data['sockets']} Sockets x {data['cores']} Cores</div>
                     <div>{data['host_cap_cores']} Physical Cores</div>
                     <div>{data['ram']} GB RAM</div>
                 </div>
                 <div>
-                    <div style="font-weight:bold; margin-bottom:5px;">Cluster Capacity (Day 1)</div>
+                    <div><strong>Cluster Capacity (Day 1)</strong></div>
                     <div>{data['hosts_now'] * data['host_cap_cores']} Total Cores</div>
                     <div>{data['hosts_now'] * data['ram']:,.0f} GB Total RAM</div>
-                    <div style="color:#666; font-size:0.9em; margin-top:5px;">Design Limit: {data['ratio_now']:.1f}:1 Ratio</div>
                 </div>
             </div>
         </div>
@@ -223,7 +181,7 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
         <div class="card">
             <div class="grid">
                 <div>
-                    <span class="section-label">Current Host Supply</span>
+                    <span class="section-label">Legacy Supply (Consolidated)</span>
                     <table>
                         <tr><th>Hosts</th><th>Physical Cores</th><th>Total RAM</th></tr>
                         <tr><td>{data['cur_host_count']}</td><td>{data['cur_cores']:,.0f}</td><td>{data['cur_total_ram_gb']:,.0f} GB</td></tr>
@@ -243,17 +201,18 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
         <div class="grid">
             <div class="card">
                 <div class="section-label">VM Allocation (vInfo)</div>
-                <div style="font-size:0.85em; color:#666; margin-bottom:10px;">Allocated by VMs</div>
                 <table>
-                    <tr><td>Provisioned:</td><td><strong>{data['vinfo_prov']:,.1f} TB</strong></td></tr>
-                    <tr><td>In Use:</td><td><strong>{data['vinfo_used']:,.1f} TB</strong></td></tr>
-                    <tr><td>Backup Scope:</td><td><strong>{data['bak_cons']:,.1f} TB</strong></td></tr>
+                    <tr><td>Provisioned:</td><td><strong>{data.get('vinfo_prov', 0):,.1f} TB</strong></td></tr>
+                    <tr><td>In Use:</td><td><strong>{data.get('vinfo_used', 0):,.1f} TB</strong></td></tr>
                 </table>
             </div>
             <div class="card">
-                <div class="section-label">Infrastructure (Raw)</div>
-                <div class="note-box">Note: Capacity represents Global Shared Storage if not filtered.</div>
-                {store_infra_html}
+                <div class="section-label">Infrastructure</div>
+                <table>
+                    <tr><td>Total Capacity:</td><td><strong>{data['ds_cap']:,.1f} TB</strong></td></tr>
+                    <tr><td>Free Space:</td><td><strong>{data['ds_free']:,.1f} TB</strong></td></tr>
+                </table>
+                {vsan_html}
             </div>
         </div>
 
@@ -263,7 +222,6 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
                 <div class="section-label">NUMA Boundary</div>
                 <table>
                     <tr><th>Hardware</th><th>Cores</th><th>Memory</th></tr>
-                    <tr><td>Current</td><td>{data['cur_numa_cores_est']:.0f}</td><td>{data['cur_numa_ram_est']:.0f} GB</td></tr>
                     <tr><td>Target</td><td>{data['tgt_numa_cores']}</td><td>{data['tgt_numa_ram']:.0f} GB</td></tr>
                 </table>
             </div>
@@ -279,503 +237,390 @@ def generate_html_report(data, cluster_name, source_filename, customer_name, log
                 <div>
                     <div class="section-label">Legacy State</div>
                     <div class="metric">{data['cur_lic_cores']:,.0f} Cores</div>
-                    <div style="margin-bottom:10px;"><strong>Edition:</strong> {data['lic_edition']}</div>
-                    <div class="sub-metric">{data['cur_host_count']} Hosts</div>
+                    <div style="margin-bottom:10px;">{data['cur_host_count']} Hosts</div>
                 </div>
                 <div>
                     <div class="section-label">Current Refresh</div>
                     <div class="metric">{data['now_lic_cores']:,.0f} Cores</div>
-                    <div class="sub-metric">{data['hosts_now']} Hosts</div>
-                    <div style="font-size:0.8em; color:#666; margin-top:5px;">(Before Growth)</div>
+                    <div style="margin-bottom:10px;">{data['hosts_now']} Hosts</div>
                 </div>
                 <div>
                     <div class="section-label">Future w/ Growth</div>
                     <div class="metric">{data['fut_lic_cores']:,.0f} Cores</div>
-                    <div class="sub-metric">{data['hosts_fut']} Hosts</div>
-                    <div class="lic-delta" style="margin-top:5px;">Net: {lic_prefix}{data['lic_diff']} Cores</div>
+                    <div class="lic-delta">Net: {lic_prefix}{data['lic_diff']} Cores</div>
                 </div>
             </div>
         </div>
 
         {perf_html}
-
+        
         <div class="footer">Generated by {APP_TITLE} | Source: {source_filename}</div>
     </body>
     </html>
     """
     return html
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="📊")
-
-# --- SIDEBAR ---
-st.sidebar.title("⚙️ Sizing Parameters")
-st.sidebar.subheader("1. Target Hardware")
-tgt_sockets = st.sidebar.number_input("Sockets/Host", 1, 4, 2)
-tgt_cores = st.sidebar.number_input("Cores/Socket", 4, 128, 24)
-tgt_ram = st.sidebar.number_input("RAM/Host (GB)", 64, 4096, 1024)
-tgt_clock = st.sidebar.number_input("CPU Speed (GHz)", 1.0, 5.0, 2.5, help="Used for Live Optics Performance sizing")
-
-lo_basis = st.sidebar.radio(
-    "Live Optics Basis", 
-    ["95th Percentile", "Peak CPU", "Average CPU"], 
-    index=0, 
-    help="Determines the GHZ demand used for performance sizing. '95th' is estimated as 95% of Peak if raw data is missing."
-)
-
-host_cap_cores = tgt_sockets * tgt_cores
-tgt_numa_cores = tgt_cores
-tgt_numa_ram = tgt_ram / tgt_sockets
-st.sidebar.info(f"**Host Spec:**\n{host_cap_cores} Cores | {tgt_ram} GB RAM\n\n**NUMA Node:**\n{tgt_numa_cores} Cores | {tgt_numa_ram:.0f} GB")
-
-st.sidebar.subheader("2. Constraints")
-vcpu_ratio = st.sidebar.slider("Max vCPU:pCPU (Design Limit)", 1.0, 10.0, 5.0, 0.5)
-cpu_buffer = st.sidebar.slider("CPU Overhead (%)", 0, 50, 10)
-ram_buffer = st.sidebar.slider("RAM Overhead (%)", 0, 50, 10)
-min_hosts = st.sidebar.number_input("Min Cluster Size", 1, 32, 3)
-ha_nodes = st.sidebar.number_input("HA Tolerance", 0, 4, 1)
-
-st.sidebar.subheader("3. Scope & Growth")
-include_off = st.sidebar.checkbox("Include Powered Off VMs?", value=True)
-growth = st.sidebar.number_input("Annual Growth (%)", 0.0, 100.0, 10.0) / 100
-years = st.sidebar.number_input("Years", 1, 10, 3)
-
-st.sidebar.divider()
-st.sidebar.subheader("📥 Report Settings")
-cust_name = st.sidebar.text_input("Customer Name", "My Customer")
-logo_url = st.sidebar.text_input("Logo URL", DEFAULT_LOGO)
-if logo_url: st.sidebar.image(logo_url, width=150)
-
-# --- MAIN ---
-st.title(f"📊 {APP_TITLE}")
-st.markdown(f"Automated hardware sizing analysis for **{cust_name}**.")
-uploaded_files_list = st.file_uploader(
-    "Upload Source Files (RVTools .xlsx or Live Optics .xlsx)", 
-    type=["xlsx"], 
-    accept_multiple_files=True,
-    label_visibility="visible"
-)
-
-if not uploaded_files_list:
-    st.info("👆 Please upload one or more files to begin.")
-    st.stop()
-
-# --- FILE SELECTION LOGIC ---
-file_map = {f.name: f for f in uploaded_files_list}
-selected_filename = st.selectbox("Select File to Analyze:", list(file_map.keys()))
-uploaded_file = file_map[selected_filename]
-
-# RESET BUFFER (Crucial for data reloading)
-uploaded_file.seek(0)
-
-# --- PARSERS ---
-def process_rvtools(sheets, selected_cluster, include_off):
-    # Sheets dict key strip
-    sheets = clean_sheet_names(sheets)
-    
-    df_info = sheets['vInfo']
-    df_info.columns = df_info.columns.str.strip()
-    
-    # Get cluster list first from raw data
-    cluster_source = df_info
-    
-    # Filter Logic
-    if 'Cluster' in df_info.columns and selected_cluster != "All Clusters":
-        df_info = df_info[df_info['Cluster'] == selected_cluster]
-    if 'Powerstate' in df_info.columns and not include_off:
-        df_info = df_info[df_info['Powerstate'].astype(str).str.contains('poweredOn', case=False, na=False)]
-    
-    if 'Memory' in df_info.columns and 'Memory GB' not in df_info.columns:
-        df_info['Memory GB'] = pd.to_numeric(df_info['Memory'], errors='coerce') / 1024
-    
-    cur_cores, cur_host_count, cur_total_ram_gb = 0, 0, 0
-    cur_numa_cores_est, cur_numa_ram_est, cur_lic_cores = 0, 0, 0
-    lic_edition = "Unknown"
-    
-    if 'vHost' in sheets:
-        df_h = sheets['vHost']
-        df_h.columns = df_h.columns.str.strip()
-        if 'Cluster' in df_h.columns and selected_cluster != "All Clusters":
-            df_h = df_h[df_h['Cluster'] == selected_cluster]
-        cur_host_count = len(df_h)
-        if not df_h.empty:
-            df_h['TC'] = df_h['# CPU'] * df_h['Cores per CPU']
-            cur_cores = pd.to_numeric(df_h['TC'], errors='coerce').sum()
-            cur_total_ram_gb = pd.to_numeric(df_h['# Memory'], errors='coerce').sum() / 1024
-            try:
-                cur_sockets_mode = df_h['# CPU'].mode()[0]
-                cur_cores_mode = df_h['Cores per CPU'].mode()[0]
-                cur_ram_mb_mode = df_h['# Memory'].mode()[0]
-                cur_numa_cores_est = cur_cores_mode
-                cur_numa_ram_est = (cur_ram_mb_mode / 1024) / cur_sockets_mode
-            except: pass
-            for _, row in df_h.iterrows():
-                cur_lic_cores += (row['# CPU'] * max(row['Cores per CPU'], 16))
-            if 'Product' in df_h.columns:
-                lic_edition = df_h['Product'].mode()[0]
-
-    ds = {"cap": 0, "used": 0, "free": 0, "prov": 0, "note": "Global"}
-    if 'vDatastore' in sheets:
-        df_ds = sheets['vDatastore']
-        df_ds.columns = df_ds.columns.str.strip()
-        if 'Name' in df_ds.columns: df_ds = df_ds[~df_ds['Name'].astype(str).str.contains('local', case=False, na=False)]
-        if 'Cluster' in df_ds.columns and selected_cluster != "All Clusters":
-            df_ds = df_ds[df_ds['Cluster'] == selected_cluster]
-            ds["note"] = f"Filtered to {selected_cluster}"
-        ds["cap"] = get_rvtools_tb(df_ds, 'Capacity')
-        ds["used"] = get_rvtools_tb(df_ds, 'In Use')
-        ds["prov"] = get_rvtools_tb(df_ds, 'Provisioned')
-        ds["free"] = ds["cap"] - ds["used"]
-
-    bak_cons, rdm_cap, rdm_cnt = 0, 0, 0
-    if 'vPartition' in sheets:
-        df_p = sheets['vPartition']
-        df_p.columns = df_p.columns.str.strip()
-        if 'VM' in df_p.columns and 'VM' in df_info.columns: df_p = df_p[df_p['VM'].isin(df_info['VM'])]
-        bak_cons = get_rvtools_tb(df_p, 'Consumed')
-    if 'vDisk' in sheets:
-        df_d = sheets['vDisk']
-        df_d.columns = df_d.columns.str.strip()
-        if 'VM' in df_d.columns and 'VM' in df_info.columns: df_d = df_d[df_d['VM'].isin(df_info['VM'])]
-        if 'Raw' in df_d.columns:
-            df_rdm = df_d[df_d['Raw'].astype(str).str.contains('True', case=False, na=False)]
-            rdm_cnt = len(df_rdm)
-            rdm_cap = get_rvtools_tb(df_rdm, 'Capacity')
-
-    max_vm_cpu, max_vm_ram = 0, 0
-    name_max_cpu, name_max_ram = "N/A", "N/A"
-    if not df_info.empty:
-        max_vm_cpu = df_info['CPUs'].max()
-        max_vm_ram = df_info['Memory GB'].max()
-        try: name_max_cpu = df_info.loc[df_info['CPUs'].idxmax(), 'VM']
-        except: pass
-        try: name_max_ram = df_info.loc[df_info['Memory GB'].idxmax(), 'VM']
-        except: pass
-
-    return {
-        'tot_vms': len(df_info), 'tot_vcpu': safe_sum(df_info, 'CPUs'), 'tot_ram': safe_sum(df_info, 'Memory GB'),
-        'vinfo_prov': get_rvtools_tb(df_info, 'Provisioned'), 'vinfo_used': get_rvtools_tb(df_info, 'In Use'),
-        'max_vm_cpu': max_vm_cpu, 'max_vm_ram': max_vm_ram, 'name_max_cpu': name_max_cpu, 'name_max_ram': name_max_ram,
-        'cur_cores': cur_cores, 'cur_host_count': cur_host_count, 'cur_total_ram_gb': cur_total_ram_gb, 'cur_lic_cores': cur_lic_cores,
-        'cur_numa_cores_est': cur_numa_cores_est, 'cur_numa_ram_est': cur_numa_ram_est,
-        'ds': ds, 'bak_cons': bak_cons, 'rdm_cap': rdm_cap, 'rdm_cnt': rdm_cnt,
-        'has_perf': False, 'perf_ghz_demand': 0, 'lic_edition': lic_edition,
-        'df_raw_vinfo': df_info, 'df_raw_vhost': sheets.get('vHost', pd.DataFrame())
+# --- PROCESSORS ---
+def process_data(sheets, source_type, selected_clusters, include_off, perf_metric):
+    db = {
+        'tot_vms': 0, 'tot_vcpu': 0, 'tot_ram': 0, 
+        'vinfo_prov': 0, 'vinfo_used': 0, 'bak_cons': 0,
+        'cur_cores': 0, 'cur_host_count': 0, 'cur_total_ram_gb': 0, 'cur_lic_cores': 0,
+        'max_vm_cpu': 0, 'max_vm_ram': 0, 'name_max_cpu': "N/A", 'name_max_ram': "N/A",
+        'ds_cap': 0, 'ds_used': 0, 'ds_free': 0,
+        'has_perf': False, 'perf_ghz_demand': 0, 'lic_edition': "Unknown",
+        'vsan_detected': False
     }
 
-def process_live_optics(sheets, selected_cluster, include_off, perf_metric):
-    sheets = clean_sheet_names(sheets)
-    
-    df_vm = sheets['VMs']
-    df_vm.columns = df_vm.columns.str.strip()
-    
-    # Filter Logic
-    if 'Cluster' in df_vm.columns and selected_cluster != "All Clusters":
-        df_vm = df_vm[df_vm['Cluster'] == selected_cluster]
-    if 'Power State' in df_vm.columns and not include_off:
-        df_vm = df_vm[df_vm['Power State'].astype(str).str.contains('poweredOn', case=False, na=False)]
+    # Helper: Filter a DF by the LIST of selected clusters
+    def apply_filter(df, col_c, col_p):
+        if df is None: return None
+        if col_c and selected_clusters:
+            c_name = get_col(df, col_c)
+            if c_name: 
+                # Use .isin() for multi-select filtering
+                df = df[df[c_name].isin(selected_clusters)]
+        if col_p and not include_off:
+            p_name = get_col(df, col_p)
+            if p_name: df = df[df[p_name].astype(str).str.contains('poweredOn', case=False, na=False)]
+        return df
 
-    df_h = sheets.get('ESX Hosts', pd.DataFrame())
-    if not df_h.empty:
-        df_h.columns = df_h.columns.str.strip()
-        if 'Cluster' in df_h.columns and selected_cluster != "All Clusters":
-            df_h = df_h[df_h['Cluster'] == selected_cluster]
-
-    df_dev = sheets.get('Host Devices', pd.DataFrame())
-    ds = {"cap": 0, "used": 0, "free": 0, "prov": 0, "note": "Global"}
-    if not df_dev.empty:
-        df_dev.columns = df_dev.columns.str.strip()
-        ds["cap"] = safe_sum(df_dev, 'Capacity (GiB)') / 1024
-        ds["used"] = safe_sum(df_dev, 'Used Capacity (GiB)') / 1024
-        ds["free"] = safe_sum(df_dev, 'Free Capacity (GiB)') / 1024
-        ds["note"] = "Derived from Host Devices (LUNs)"
-
-    # Performance
-    has_perf = False
-    perf_ghz_demand = 0
-    if 'ESX Performance' in sheets:
-        df_perf = sheets['ESX Performance']
-        df_perf.columns = df_perf.columns.str.strip()
-        if 'Cluster' in df_perf.columns and selected_cluster != "All Clusters":
-            df_perf = df_perf[df_perf['Cluster'] == selected_cluster]
-        
-        if perf_metric == "95th Percentile":
-            if '95th Percentile CPU (GHz)' in df_perf.columns:
-                perf_ghz_demand = safe_sum(df_perf, '95th Percentile CPU (GHz)')
-            else:
-                perf_ghz_demand = safe_sum(df_perf, 'Peak CPU (GHz)') * 0.95
-        elif perf_metric == "Peak CPU":
-            perf_ghz_demand = safe_sum(df_perf, 'Peak CPU (GHz)')
-        else: # Average
-            perf_ghz_demand = safe_sum(df_perf, 'Average CPU (GHz)')
-            
-        has_perf = True
-
-    # Host Supply Logic
-    cur_cores = safe_sum(df_h, 'CPU Cores')
-    cur_total_ram_gb = safe_sum(df_h, 'Memory (KiB)') / 1024 / 1024
-    cur_lic_cores = 0
-    cur_numa_cores_est, cur_numa_ram_est = 0, 0
-    lic_edition = "Unknown"
-    
-    if not df_h.empty:
-        try:
-            cur_sockets_mode = df_h['CPU Sockets'].mode()[0]
-            df_h['CoresPerSocket'] = df_h['CPU Cores'] / df_h['CPU Sockets']
-            cur_cores_mode = df_h['CoresPerSocket'].mode()[0]
-            cur_numa_cores_est = cur_cores_mode
-            cur_numa_ram_est = (cur_total_ram_gb / len(df_h)) / cur_sockets_mode
-        except: pass
-        
-        for _, row in df_h.iterrows():
-            try: cur_lic_cores += (row['CPU Sockets'] * max(row['CPU Cores'] / row['CPU Sockets'], 16))
-            except: pass
-
-    if 'ESX Licenses' in sheets:
-        df_lic = sheets['ESX Licenses']
-        df_lic.columns = df_lic.columns.str.strip()
-        if 'Software Title' in df_lic.columns:
-            try: lic_edition = df_lic['Software Title'].mode()[0]
-            except: pass
-
-    # Max VM
-    max_vm_cpu, max_vm_ram = 0, 0
-    name_max_cpu, name_max_ram = "N/A", "N/A"
-    bak_cons = 0
-    
-    if not df_vm.empty:
-        max_vm_cpu = df_vm['Virtual CPU'].max()
-        max_vm_ram = df_vm['Provisioned Memory (MiB)'].max() / 1024
-        bak_cons = safe_sum(df_vm, 'Guest VM Disk Used (MiB)') / 1048576 
-        
-        try: name_max_cpu = df_vm.loc[df_vm['Virtual CPU'].idxmax(), 'VM Name']
-        except: pass
-        try: name_max_ram = df_vm.loc[df_vm['Provisioned Memory (MiB)'].idxmax(), 'VM Name']
-        except: pass
-
-    return {
-        'tot_vms': len(df_vm), 'tot_vcpu': safe_sum(df_vm, 'Virtual CPU'), 'tot_ram': safe_sum(df_vm, 'Provisioned Memory (MiB)') / 1024,
-        'vinfo_prov': safe_sum(df_vm, 'Virtual Disk Size (MiB)') / 1048576, 'vinfo_used': safe_sum(df_vm, 'Virtual Disk Used (MiB)') / 1048576,
-        'max_vm_cpu': max_vm_cpu, 'max_vm_ram': max_vm_ram, 'name_max_cpu': name_max_cpu, 'name_max_ram': name_max_ram,
-        'cur_cores': cur_cores, 'cur_host_count': len(df_h), 'cur_total_ram_gb': cur_total_ram_gb, 'cur_lic_cores': cur_lic_cores,
-        'cur_numa_cores_est': cur_numa_cores_est, 'cur_numa_ram_est': cur_numa_ram_est,
-        'ds': ds, 'bak_cons': bak_cons, 'rdm_cap': 0, 'rdm_cnt': 0,
-        'has_perf': has_perf, 'perf_ghz_demand': perf_ghz_demand, 'lic_edition': lic_edition,
-        'lo_basis': perf_metric,
-        'df_raw_vinfo': df_vm, 'df_raw_vhost': df_h
-    }
-
-# --- EXECUTION ---
-try:
-    # 1. READ FILE
-    sheets = pd.read_excel(uploaded_file, sheet_name=None, engine='openpyxl')
-    sheets = clean_sheet_names(sheets) # Initial clean
-    
-    # 2. DETECT TYPE & CLUSTERS
-    if 'vInfo' in sheets:
-        source_type = "RVTools"
-        cluster_source = sheets['vInfo']
-        cluster_col = 'Cluster'
-    elif 'VMs' in sheets and 'ESX Hosts' in sheets:
-        source_type = "LiveOptics"
-        cluster_source = sheets['VMs']
-        cluster_col = 'Cluster'
-    else:
-        st.error("Unknown file format. Please ensure tabs match RVTools (vInfo) or Live Optics (VMs/ESX Hosts).")
-        st.stop()
-
-    st.success(f"📂 **{source_type}** Detected")
-    
-    # Clean cluster column for dropdown
-    cluster_source.columns = cluster_source.columns.str.strip()
-    
-    if cluster_col and cluster_col in cluster_source.columns:
-        clusters = sorted(cluster_source[cluster_col].dropna().unique())
-        selected_cluster = st.selectbox("Select Cluster Scope:", clusters)
-    else: selected_cluster = "All Clusters"
-
-    # 3. PROCESS
+    # 1. VM Processing
+    df_vm = None
     if source_type == "RVTools":
-        db = process_rvtools(sheets, selected_cluster, include_off)
-    else:
-        db = process_live_optics(sheets, selected_cluster, include_off, lo_basis)
-
-    # 4. MATH
-    eff_host_cores = host_cap_cores * (1 - cpu_buffer/100)
-    eff_host_ram = tgt_ram * (1 - ram_buffer/100)
-    
-    hosts_for_cpu = math.ceil(db['tot_vcpu'] / vcpu_ratio / eff_host_cores)
-    hosts_for_ram = math.ceil(db['tot_ram'] / eff_host_ram)
-    
-    if hosts_for_cpu > hosts_for_ram:
-        constraint = "CPU"
-        raw_hosts = hosts_for_cpu
-        raw_hosts_cpu = hosts_for_cpu
-        raw_hosts_ram = hosts_for_ram
-    else:
-        constraint = "RAM"
-        raw_hosts = hosts_for_ram
-        raw_hosts_cpu = hosts_for_cpu
-        raw_hosts_ram = hosts_for_ram
-
-    mult = (1 + growth) ** years
-    fut_vcpu = db['tot_vcpu'] * mult
-    fut_hosts_for_cpu = math.ceil(fut_vcpu / vcpu_ratio / eff_host_cores)
-    fut_hosts_for_ram = math.ceil((db['tot_ram'] * mult) / eff_host_ram)
-    fut_raw_hosts = max(fut_hosts_for_cpu, fut_hosts_for_ram)
-    
-    hosts_now = max(int(raw_hosts) + ha_nodes, min_hosts)
-    hosts_fut = max(int(fut_raw_hosts) + ha_nodes, min_hosts)
-    
-    pcores_now = hosts_now * host_cap_cores
-    # Corrected Calculation from previous fix
-    cur_ratio = db['tot_vcpu'] / db['cur_cores'] if db['cur_cores'] > 0 else 0
-    ratio_now = db['tot_vcpu'] / pcores_now
-    ratio_fail = db['tot_vcpu'] / ((hosts_now - ha_nodes) * host_cap_cores) if (hosts_now - ha_nodes) > 0 else 0
-    ratio_fut = fut_vcpu / (hosts_fut * host_cap_cores)
-
-    perf_hosts_rec = 0
-    if db['has_perf']:
-        node_ghz_cap = tgt_sockets * tgt_cores * tgt_clock
-        node_ghz_usable = node_ghz_cap * (1 - cpu_buffer/100)
-        hosts_needed_ghz = math.ceil(db['perf_ghz_demand'] / (node_ghz_usable * 0.8))
-        perf_hosts_rec = max(hosts_needed_ghz + ha_nodes, min_hosts)
-
-    fut_lic_per_node = calc_license_cores(tgt_sockets, tgt_cores)
-    now_lic_cores = hosts_now * fut_lic_per_node
-    fut_lic_cores = hosts_fut * fut_lic_per_node
-    lic_diff = fut_lic_cores - db['cur_lic_cores']
-    lic_prefix = "+" if lic_diff > 0 else ""
-
-    # 5. REPORT EXPORT
-    report_data = {
-        'hosts_now': hosts_now, 'ha_nodes': ha_nodes, 'ratio_now': ratio_now,
-        'hosts_fut': hosts_fut, 'years': years, 'growth': growth, 'fut_vcpu': fut_vcpu,
-        'tot_vms': db['tot_vms'], 'tot_vcpu': db['tot_vcpu'], 'tot_ram': db['tot_ram'],
-        'sockets': tgt_sockets, 'cores': tgt_cores, 'ram': tgt_ram, 'host_cap_cores': host_cap_cores,
-        'ds_cap': db['ds']['cap'], 'ds_used': db['ds']['used'], 'ds_free': db['ds']['free'], 'ds_scope_note': db['ds']['note'],
-        'vinfo_prov': db['vinfo_prov'], 'vinfo_used': db['vinfo_used'], 'bak_cons': db['bak_cons'],
-        'cur_host_count': db['cur_host_count'], 'cur_lic_cores': int(db['cur_lic_cores']),
-        'now_lic_cores': int(now_lic_cores), 'fut_lic_cores': int(fut_lic_cores), 'lic_diff': int(lic_diff),
-        'cur_cores': db['cur_cores'], 'cur_total_ram_gb': db['cur_total_ram_gb'],
-        'constraint': constraint, 'raw_hosts_cpu': raw_hosts_cpu, 'raw_hosts_ram': raw_hosts_ram, 'raw_hosts': raw_hosts,
-        'eff_host_cores': eff_host_cores, 'eff_host_ram': eff_host_ram, 'hosts_for_cpu': hosts_for_cpu, 'hosts_for_ram': hosts_for_ram,
-        'cur_numa_cores_est': db['cur_numa_cores_est'], 'cur_numa_ram_est': db['cur_numa_ram_est'],
-        'tgt_numa_cores': tgt_numa_cores, 'tgt_numa_ram': tgt_numa_ram,
-        'max_vm_cpu': db['max_vm_cpu'], 'max_vm_ram': db['max_vm_ram'],
-        'name_max_cpu': db['name_max_cpu'], 'name_max_ram': db['name_max_ram'],
-        'cur_ratio': cur_ratio, 'ratio_fut': ratio_fut,
-        'has_perf': db['has_perf'], 'perf_ghz_demand': db['perf_ghz_demand'], 'perf_hosts_rec': perf_hosts_rec, 'lo_basis': lo_basis,
-        'lic_edition': db['lic_edition']
-    }
-
-    clean_filename = os.path.splitext(uploaded_file.name)[0]
-    out_name = f"{clean_filename}_{selected_cluster}_Sizing.html"
-    html_string = generate_html_report(report_data, selected_cluster, uploaded_file.name, cust_name, logo_url)
-    st.sidebar.download_button("Download Report", html_string, file_name=out_name, mime="text/html")
-
-    # 6. DASHBOARD
-    tab1, tab2 = st.tabs(["📋 Executive Report", "🔍 Raw Data Analysis"])
-
-    with tab1:
-        st.subheader("1. Executive Sizing Recommendation")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.info(f"### 📅 Current Refresh Requirement", icon="📅")
-            st.markdown(f"**Cluster Config:** {hosts_now} Nodes (N+{ha_nodes} HA)")
-            
-            st.markdown("#### 🔧 Hardware Specs")
-            st.write(f"**Per Node:** {tgt_sockets} Sockets | {host_cap_cores} Cores | {tgt_ram} GB RAM")
-            st.write(f"**Cluster Total:** {hosts_now * host_cap_cores} Cores | {hosts_now * tgt_ram:,.0f} GB RAM")
-            st.markdown("#### 📉 CPU Oversubscription")
-            st.metric("Efficiency (vCPU:pCPU)", f"{ratio_now:.1f}:1", help="Total Cluster Efficiency (including HA nodes)")
-            
-            st.divider()
-            if constraint == "RAM": st.warning(f"⚠️ **Constraint: Memory Bound**")
-            else: st.success(f"✅ **Constraint: CPU Bound**")
-            
-            st.markdown("#### 📊 Sizing Logic")
-            st.write(f"**1. Workload:** {db['tot_vcpu']:,.0f} vCPU, {db['tot_ram']:,.0f} GB RAM")
-            st.write(f"**2. Effective Host:** {eff_host_cores:.1f} Cores, {eff_host_ram:.1f} GB RAM")
-            st.write(f"**3. Hosts Needed:** CPU: {hosts_for_cpu}, RAM: {hosts_for_ram}")
-            st.write(f"**4. Constraint:** {constraint} -> {raw_hosts} active nodes")
-            st.write(f"**5. Final:** {raw_hosts} + {ha_nodes} HA = {hosts_now} Hosts")
-
-        with c2:
-            st.success(f"### 🚀 Future Requirement with Growth", icon="🚀")
-            st.markdown(f"**Cluster Config:** {hosts_fut} Nodes (+{growth*100:.0f}% Growth / {years} Years)")
-            st.markdown("#### 🔧 Hardware Specs")
-            st.write(f"**Per Node:** {tgt_sockets} Sockets | {host_cap_cores} Cores | {tgt_ram} GB RAM")
-            st.write(f"**Cluster Total:** {hosts_fut * host_cap_cores} Cores | {hosts_fut * tgt_ram:,.0f} GB RAM")
-            st.markdown("#### 📉 CPU Density")
-            st.write(f"**Future Ratio:** {ratio_fut:.1f}:1")
-
-        st.subheader(f"2. Workload Scope ({selected_cluster})")
-        with st.container(border=True):
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("VMs", f"{db['tot_vms']}")
-            sc2.metric("vCPU", f"{db['tot_vcpu']:,.0f}")
-            sc3.metric("vRAM", f"{db['tot_ram']:,.0f} GB")
-            sc4.metric("Current Ratio", f"{cur_ratio:.1f}:1")
-
-        st.subheader("3. Storage Requirements")
-        c_alloc, c_infra = st.columns(2)
-        with c_alloc:
-            with st.container(border=True):
-                st.markdown(f"#### 📦 VM Allocation (VMDK)")
-                st.write(f"**Provisioned:** {db['vinfo_prov']:,.1f} TB")
-                st.write(f"**In Use:** {db['vinfo_used']:,.1f} TB")
-                st.markdown("---")
-                st.write(f"🔹 **Guest OS (Backup):** {db['bak_cons']:.1f} TB")
-        with c_infra:
-            with st.container(border=True):
-                st.markdown(f"#### 🏢 Infrastructure ({db['ds']['note']})")
-                if db['ds']['cap'] > 0:
-                    st.write(f"**Total Capacity:** {db['ds']['cap']:,.1f} TB")
-                    st.write(f"**Free Space:** {db['ds']['free']:,.1f} TB")
-                else:
-                    st.write("Data not available in source file.")
-
-        st.subheader("4. Architecture & NUMA")
-        st.write(f"**Target NUMA:** {tgt_numa_cores} Cores | {tgt_numa_ram:.0f} GB RAM")
+        df_vm = promote_header(sheets['vInfo'], ["VM", "Powerstate"])
+        df_vm = apply_filter(df_vm, "Cluster", "Powerstate")
+        db['tot_vcpu'] = safe_sum(df_vm, 'CPUs')
+        db['tot_ram'] = safe_sum(df_vm, 'Memory') / 1024
+        db['vinfo_prov'] = get_rvtools_tb(df_vm, 'Provisioned')
+        db['vinfo_used'] = get_rvtools_tb(df_vm, 'In Use')
         
-        # Dashboard NUMA
-        if db['max_vm_cpu'] > 0:
-             is_wide_cpu = db['max_vm_cpu'] > tgt_numa_cores
-             msg_cpu = f"Largest vCPU VM: **{db['name_max_cpu']}** ({db['max_vm_cpu']} vCPU)"
-             if is_wide_cpu: st.error(f"⚠️ {msg_cpu} exceeds NUMA cores!")
-             else: st.success(f"✅ {msg_cpu} fits NUMA cores.")
-             
-        if db['max_vm_ram'] > 0:
-             is_wide_ram = db['max_vm_ram'] > tgt_numa_ram
-             msg_ram = f"Largest RAM VM: **{db['name_max_ram']}** ({db['max_vm_ram']:.0f} GB)"
-             if is_wide_ram: st.error(f"⚠️ {msg_ram} exceeds NUMA RAM!")
-             else: st.success(f"✅ {msg_ram} fits NUMA RAM.")
+    elif source_type == "LiveOptics":
+        df_vm = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
+        df_vm = apply_filter(df_vm, "Cluster", "Power State")
+        db['tot_vcpu'] = safe_sum(df_vm, 'Virtual CPU')
+        db['tot_ram'] = safe_sum(df_vm, 'Provisioned Memory') / 1024
+        db['vinfo_prov'] = safe_sum(df_vm, 'Virtual Disk Size') / 1048576
+        db['vinfo_used'] = safe_sum(df_vm, 'Virtual Disk Used') / 1048576
 
-        st.subheader("5. Licensing")
-        l1, l2, l3 = st.columns(3)
-        with l1:
-            st.metric("Legacy State", f"{db['cur_lic_cores']:,.0f} Cores", f"{db['cur_host_count']} Hosts")
-            st.caption(f"Edition: {db['lic_edition']}")
-        with l2:
-            st.metric("Current Refresh", f"{now_lic_cores:,.0f} Cores", f"{hosts_now} Hosts")
-        with l3:
-            st.metric("Future w/ Growth", f"{fut_lic_cores:,.0f} Cores", f"{lic_prefix}{lic_diff:.0f} Net Change")
+    if df_vm is not None:
+        db['tot_vms'] = len(df_vm)
+        c_col = get_col(df_vm, 'CPU')
+        m_col = get_col(df_vm, 'Memory')
+        n_col = get_col(df_vm, 'VM') or get_col(df_vm, 'Name')
+        
+        if c_col: 
+            db['max_vm_cpu'] = to_float(df_vm[c_col]).max()
+            if n_col: db['name_max_cpu'] = df_vm.loc[to_float(df_vm[c_col]).idxmax(), n_col]
+        if m_col: 
+            db['max_vm_ram'] = to_float(df_vm[m_col]).max() / 1024
+            if n_col: db['name_max_ram'] = df_vm.loc[to_float(df_vm[m_col]).idxmax(), n_col]
 
-        if db['has_perf']:
-            st.divider()
-            st.subheader("6. Performance Analysis (Live Optics)")
-            p1, p2 = st.columns(2)
-            p1.metric("Allocated vCPU", f"{db['tot_vcpu']:,.0f}")
-            p2.metric(f"Consumed {lo_basis.split()[0]} GHz", f"{db['perf_ghz_demand']:,.1f} GHz")
+    # 2. Host Processing
+    df_h = None
+    host_to_cluster = {}
+    
+    if source_type == "RVTools" and 'vHost' in sheets:
+        df_h = promote_header(sheets['vHost'], ["Host", "CPU"])
+        df_h = apply_filter(df_h, "Cluster", None)
+        cpu_col = get_col(df_h, '# CPU')
+        core_col = get_col(df_h, 'Cores per CPU')
+        mem_col = get_col(df_h, '# Memory')
+        if cpu_col and core_col:
+            db['cur_cores'] = (to_float(df_h[cpu_col]) * to_float(df_h[core_col])).sum()
+            if mem_col: db['cur_total_ram_gb'] = to_float(df_h[mem_col]).sum() / 1024
+            for _, row in df_h.iterrows():
+                db['cur_lic_cores'] += (float(row[cpu_col]) * max(float(row[core_col]), 16))
+
+    elif source_type == "LiveOptics" and 'ESX Hosts' in sheets:
+        df_h = promote_header(sheets['ESX Hosts'], ["Host Name", "CPU Cores"])
+        
+        # Build Map for storage mapping
+        nm_col = get_col(df_h, 'Host Name')
+        cl_col = get_col(df_h, 'Cluster')
+        if nm_col and cl_col:
+            host_to_cluster = pd.Series(df_h[cl_col].values, index=df_h[nm_col]).to_dict()
             
-            perf_insight_color = "green" if perf_hosts_rec < hosts_now else "red"
-            st.caption(f"Based on {lo_basis} metrics.")
-            st.markdown(f":{perf_insight_color}[**Analysis:** Workload could run on {perf_hosts_rec} Hosts (vs {hosts_now} Allocation).]")
+        df_h = apply_filter(df_h, "Cluster", None)
+        db['cur_cores'] = safe_sum(df_h, 'CPU Cores')
+        mem_col = get_col(df_h, 'Memory')
+        if mem_col: db['cur_total_ram_gb'] = to_float(df_h[mem_col]).sum() / 1024 / 1024
+        
+        s_col = get_col(df_h, 'Socket')
+        c_col = get_col(df_h, 'Cores')
+        if s_col and c_col:
+            for _, row in df_h.iterrows():
+                try:
+                    s = float(row[s_col])
+                    c = float(row[c_col])
+                    if s > 0: db['cur_lic_cores'] += (s * max(c/s, 16))
+                except: pass
+    
+    if df_h is not None:
+        db['cur_host_count'] = len(df_h)
 
-    with tab2:
-        st.write("Source Data Preview")
-        st.dataframe(db['df_raw_vinfo'].head())
+    # 3. vSAN Detection (Simple Flag Check in Scope)
+    disk_tab = next((k for k in sheets.keys() if 'disks' in k.lower() and 'vm' not in k.lower()), None)
+    if disk_tab:
+        try:
+            df_d = promote_header(sheets[disk_tab], ["Model", "Capacity"])
+            df_d = apply_filter(df_d, "Cluster", None)
+            
+            c_mod = get_col(df_d, 'Model')
+            if c_mod:
+                # Basic Heuristic: If we see non-RAID disks, flag it.
+                bad_keywords = 'BOSS|USB|SD|RAID|PERC|Virtual|DVD|CD-ROM|DELL Disk|Cisco Disk'
+                mask_logical = df_d[c_mod].astype(str).str.contains(bad_keywords, case=False, na=False)
+                if not df_d[~mask_logical].empty:
+                    db['vsan_detected'] = True
+        except: pass
 
-except Exception as e:
-    st.error(f"Error processing file: {e}")
+    # 4. Storage Capacity (Datastores/LUNs)
+    if source_type == "RVTools" and 'vDatastore' in sheets:
+        df_ds = promote_header(sheets['vDatastore'], ["Name", "Capacity"])
+        df_ds = apply_filter(df_ds, 'Cluster', None)
+        db['ds_cap'] = get_rvtools_tb(df_ds, 'Capacity')
+        db['ds_free'] = get_rvtools_tb(df_ds, 'Free')
+        db['ds_used'] = db['ds_cap'] - db['ds_free']
+        
+    elif source_type == "LiveOptics" and 'Host Devices' in sheets:
+        df_dev = promote_header(sheets['Host Devices'], ["Device Name", "Capacity"])
+        
+        # Map Server Name -> Cluster to filter correctly
+        if selected_clusters and host_to_cluster:
+            srv_col = get_col(df_dev, 'Server') or get_col(df_dev, 'Host')
+            if srv_col:
+                df_dev['ClusterMap'] = df_dev[srv_col].map(host_to_cluster)
+                df_dev = df_dev[df_dev['ClusterMap'].isin(selected_clusters)]
+
+        # Filter for Shared LUNs
+        type_col = get_col(df_dev, 'Type')
+        if type_col:
+            df_shared = df_dev[df_dev[type_col].astype(str).str.contains('Cluster', case=False, na=False)]
+            cap_col = get_col(df_shared, 'Capacity')
+            used_col = get_col(df_shared, 'Used')
+            
+            if cap_col: db['ds_cap'] = to_float(df_shared[cap_col]).sum() / 1024 # GiB -> TB
+            if used_col: db['ds_used'] = to_float(df_shared[used_col]).sum() / 1024 
+            db['ds_free'] = db['ds_cap'] - db['ds_used']
+
+    return db
+
+# --- MAIN APP ---
+st.title(f"📊 {APP_TITLE}")
+
+# SIDEBAR START
+st.sidebar.title("⚙️ Parameters")
+
+# 1. CLUSTER SLOT (Placeholder for dynamic content)
+cluster_slot = st.sidebar.empty()
+
+# 2. HARDWARE
+st.sidebar.subheader("Target Hardware")
+tgt_sockets = st.sidebar.number_input("Sockets", 1, 4, 2)
+tgt_cores = st.sidebar.number_input("Cores", 4, 128, 24)
+tgt_ram = st.sidebar.number_input("RAM (GB)", 64, 4096, 1024)
+host_cap_cores = tgt_sockets * tgt_cores
+
+# 3. CONSTRAINTS
+st.sidebar.divider()
+vcpu_ratio = st.sidebar.slider("Max vCPU:pCPU", 1.0, 10.0, 5.0, 0.5)
+cpu_buffer = st.sidebar.slider("CPU Buffer %", 0, 50, 10)
+ram_buffer = st.sidebar.slider("RAM Buffer %", 0, 50, 10)
+min_hosts = st.sidebar.number_input("Min Hosts", 1, 32, 3)
+ha_nodes = st.sidebar.number_input("HA Nodes", 0, 4, 1)
+
+# 4. SETTINGS
+st.sidebar.divider()
+include_off = st.sidebar.checkbox("Include Powered Off", True)
+growth = st.sidebar.number_input("Growth %", 0.0, 100.0, 10.0) / 100
+years = st.sidebar.number_input("Years", 1, 10, 3)
+st.sidebar.divider()
+cust_name = st.sidebar.text_input("Customer", "Client")
+logo_url = st.sidebar.text_input("Logo URL", DEFAULT_LOGO)
+
+# MAIN BODY FILE UPLOAD
+uploaded_files = st.file_uploader("Upload .xlsx Files", type=["xlsx"], accept_multiple_files=True)
+
+if uploaded_files:
+    try:
+        file_map = {f.name: f for f in uploaded_files}
+        sel_file = st.selectbox("Select File:", list(file_map.keys()))
+        
+        # Load Raw
+        sheets = pd.read_excel(file_map[sel_file], sheet_name=None, header=None, engine='openpyxl')
+        sheets = clean_sheet_names(sheets)
+        
+        # Detect
+        src_type = "Unknown"
+        df_clus = None
+        if 'vInfo' in sheets:
+            src_type = "RVTools"
+            df_clus = promote_header(sheets['vInfo'], ["VM", "Powerstate"])
+        elif 'VMs' in sheets:
+            src_type = "LiveOptics"
+            df_clus = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
+        else:
+            st.error("Invalid File Format")
+            st.stop()
+            
+        st.success(f"📂 **{src_type}** Detected")
+        
+        # --- CLUSTER SELECTION (In Sidebar Slot) ---
+        selected_clusters = []
+        with cluster_slot.container():
+            st.subheader("Cluster Scope")
+            clus_col = get_col(df_clus, "Cluster")
+            if clus_col:
+                all_clusters = sorted(df_clus[clus_col].dropna().unique())
+                st.caption("Select clusters to consolidate:")
+                # Create checkboxes
+                for c in all_clusters:
+                    if st.checkbox(f"{c}", value=True, key=f"chk_{c}"):
+                        selected_clusters.append(c)
+            else:
+                selected_clusters = ["All Clusters"]
+                st.info("No Cluster column found. Using global scope.")
+
+        if not selected_clusters:
+            st.warning("⚠️ Please select at least one cluster in the sidebar.")
+            st.stop()
+            
+        # Process
+        db = process_data(sheets, src_type, selected_clusters, include_off, "95th")
+        
+        # Sizing Math
+        eff_cores = host_cap_cores * (1 - cpu_buffer/100)
+        eff_ram = tgt_ram * (1 - ram_buffer/100)
+        
+        req_cpu = math.ceil(db['tot_vcpu'] / vcpu_ratio / eff_cores)
+        req_ram = math.ceil(db['tot_ram'] / eff_ram)
+        
+        if req_cpu > req_ram:
+            constraint = "CPU"
+            raw_hosts = req_cpu
+        else:
+            constraint = "RAM"
+            raw_hosts = req_ram
+        
+        mult = (1+growth)**years
+        fut_hosts = math.ceil(max((db['tot_vcpu']*mult)/vcpu_ratio/eff_cores, (db['tot_ram']*mult)/eff_ram))
+        
+        hosts_now = max(int(raw_hosts) + ha_nodes, min_hosts)
+        hosts_fut = max(int(fut_hosts) + ha_nodes, min_hosts)
+        
+        # Licensing Calc
+        lic_per_node = calc_license_cores(tgt_sockets, tgt_cores)
+        now_lic = hosts_now * lic_per_node
+        fut_lic = hosts_fut * lic_per_node
+        
+        # Report Pkg
+        rpt = db.copy()
+        rpt.update({
+            'hosts_now': hosts_now, 'hosts_fut': hosts_fut, 'constraint': constraint,
+            'raw_hosts': raw_hosts, 'ha_nodes': ha_nodes, 'sockets': tgt_sockets, 'cores': tgt_cores, 'ram': tgt_ram,
+            'tgt_numa_cores': tgt_cores, 'tgt_numa_ram': tgt_ram/tgt_sockets, 'growth': growth, 'years': years,
+            'ratio_now': db['tot_vcpu']/(hosts_now*host_cap_cores) if hosts_now else 0,
+            'cur_ratio': db['tot_vcpu']/db['cur_cores'] if db['cur_cores'] > 0 else 0,
+            'lo_basis': "95th", 'host_cap_cores': host_cap_cores, 'fut_vcpu': db['tot_vcpu']*mult,
+            'now_lic_cores': now_lic, 'fut_lic_cores': fut_lic, 'lic_diff': fut_lic - db['cur_lic_cores']
+        })
+        
+        scope_str = ", ".join(selected_clusters) if len(selected_clusters) < 4 else f"{len(selected_clusters)} Clusters Selected"
+        
+        # Dashboard
+        t1, t2 = st.tabs(["📋 Executive Report", "🔍 Raw Data Analysis"])
+        with t1:
+            st.subheader("1. Executive Sizing Recommendation")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.info(f"### 📅 Current Refresh Requirement")
+                st.markdown(f"**Cluster Config:** {hosts_now} Nodes (N+{ha_nodes} HA)")
+                
+                st.markdown("#### 🔧 Hardware Specs")
+                st.write(f"**Per Node:** {tgt_sockets} Sockets | {host_cap_cores} Cores | {tgt_ram} GB RAM")
+                st.write(f"**Cluster Total:** {hosts_now * host_cap_cores} Cores | {hosts_now * tgt_ram:,.0f} GB RAM")
+                st.markdown("#### 📉 CPU Oversubscription")
+                st.metric("Efficiency (vCPU:pCPU)", f"{rpt['ratio_now']:.1f}:1", help="Total Cluster Efficiency (including HA nodes)")
+                
+                st.divider()
+                if constraint == "RAM": st.warning(f"⚠️ **Constraint: Memory Bound**")
+                else: st.success(f"✅ **Constraint: CPU Bound**")
+                
+                with st.expander("View Sizing Logic"):
+                    st.write(f"**1. Workload:** {db['tot_vcpu']:,.0f} vCPU, {db['tot_ram']:,.0f} GB RAM")
+                    st.write(f"**2. Effective Host:** {eff_cores:.1f} Cores, {eff_ram:.1f} GB RAM")
+                    st.write(f"**3. Hosts Needed:** CPU: {req_cpu}, RAM: {req_ram}")
+                    st.write(f"**4. Constraint:** {constraint} -> {int(raw_hosts)} active nodes")
+                    st.write(f"**5. Final:** {int(raw_hosts)} + {ha_nodes} HA = {hosts_now} Hosts")
+
+            with c2:
+                st.success(f"### 🚀 Future Requirement with Growth")
+                st.markdown(f"**Cluster Config:** {hosts_fut} Nodes (+{growth*100:.0f}% Growth / {years} Years)")
+                st.markdown("#### 🔧 Hardware Specs")
+                st.write(f"**Per Node:** {tgt_sockets} Sockets | {host_cap_cores} Cores | {tgt_ram} GB RAM")
+                st.write(f"**Cluster Total:** {hosts_fut * host_cap_cores} Cores | {hosts_fut * tgt_ram:,.0f} GB RAM")
+            
+            st.subheader(f"2. Workload Scope")
+            st.caption(f"Consolidating: {scope_str}")
+            with st.container(border=True):
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("VMs", f"{db['tot_vms']}")
+                sc2.metric("vCPU", f"{db['tot_vcpu']:,.0f}")
+                sc3.metric("vRAM", f"{db['tot_ram']:,.0f} GB")
+                sc4.metric("Current Ratio", f"{rpt['cur_ratio']:.1f}:1")
+
+            st.subheader("3. Storage Requirements")
+            c_alloc, c_infra = st.columns(2)
+            with c_alloc:
+                with st.container(border=True):
+                    st.markdown(f"#### 📦 VM Allocation (VMDK)")
+                    st.write(f"**Provisioned:** {db.get('vinfo_prov', 0):,.1f} TB")
+                    st.write(f"**In Use:** {db.get('vinfo_used', 0):,.1f} TB")
+            with c_infra:
+                with st.container(border=True):
+                    st.markdown(f"#### 🏢 Infrastructure")
+                    st.write(f"**Total Capacity:** {db['ds_cap']:,.1f} TB")
+                    st.write(f"**Allocated:** {db['ds_used']:,.1f} TB")
+                    st.write(f"**Free:** {db['ds_free']:,.1f} TB")
+                    
+                    if db['vsan_detected']:
+                        st.divider()
+                        st.markdown(":green[**✅ vSAN Detected**]")
+                        st.caption("One or more selected clusters contain vSAN-signature disks.")
+
+            st.subheader("4. Architecture & NUMA")
+            st.write(f"**Target NUMA:** {tgt_cores} Cores | {tgt_ram/tgt_sockets:.0f} GB RAM")
+            
+            if db.get('max_vm_cpu', 0) > 0:
+                is_wide_cpu = db['max_vm_cpu'] > tgt_cores
+                msg_cpu = f"Largest vCPU VM: **{db['name_max_cpu']}** ({db['max_vm_cpu']} vCPU)"
+                if is_wide_cpu: st.error(f"⚠️ {msg_cpu} exceeds NUMA cores!")
+                else: st.success(f"✅ {msg_cpu} fits NUMA cores.")
+                
+            if db.get('max_vm_ram', 0) > 0:
+                is_wide_ram = db['max_vm_ram'] > (tgt_ram/tgt_sockets)
+                msg_ram = f"Largest RAM VM: **{db['name_max_ram']}** ({db['max_vm_ram']:.0f} GB)"
+                if is_wide_ram: st.error(f"⚠️ {msg_ram} exceeds NUMA RAM!")
+                else: st.success(f"✅ {msg_ram} fits NUMA RAM.")
+
+            st.subheader("5. Licensing")
+            l1, l2, l3 = st.columns(3)
+            with l1:
+                st.metric("Legacy State", f"{db['cur_lic_cores']:,.0f} Cores", f"{db['cur_host_count']} Hosts")
+            with l2:
+                st.metric("Current Refresh", f"{now_lic:,.0f} Cores", f"{hosts_now} Hosts")
+            with l3:
+                st.metric("Future w/ Growth", f"{fut_lic:,.0f} Cores", f"Net: {fut_lic - db['cur_lic_cores']:,.0f}")
+            
+            # Report DL
+            html = generate_html_report(rpt, scope_str, file_map[sel_file].name, cust_name, logo_url)
+            st.download_button("Download Full Report", html, "Sizing_Report.html")
+
+        with t2:
+            st.write("Source Data Preview")
+            st.dataframe(db.get('df_raw_vinfo'))
+
+    except Exception as e:
+        st.error("⚠️ Error Processing File")
+        st.code(traceback.format_exc())
