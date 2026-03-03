@@ -25,7 +25,7 @@ def clean_sheet_names(sheets):
     return {k.strip(): v for k, v in sheets.items()}
 
 def promote_header(df, keywords):
-    """Scans for a header row containing ANY of the specific keywords."""
+    """Scans for a header row containing specific keywords."""
     df = df.reset_index(drop=True)
     # Scan first 20 rows
     for i in range(min(20, len(df))):
@@ -112,19 +112,23 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
 
     # vSAN Note
     vsan_html = ""
+    rvtools_warn = ""
+    if data.get('src_type') == 'RVTools':
+        rvtools_warn = "<br><br><i style='color:#c62828; font-size:0.85em;'>⚠️ <b>Note:</b> The RVTools vSAN capacity estimate excludes the cache tier and formatting overhead. A hardware BOM or Live Optics run is required for down-to-the-byte licensing accuracy.</i>"
+        
     if data.get('vsan_detected'):
         if data.get('vsan_raw_tib', 0) > 0:
             vsan_html = f"""
             <div style="margin-top:10px; padding:8px; background:#e8f5e9; border:1px solid #c8e6c9; color:#2e7d32; border-radius:4px; font-size:0.9em;">
                 <strong>✅ vSAN/VxRail Detected in Source</strong><br>
                 Raw Capacity: <strong>{data['vsan_raw_tib']:,.1f} TiB</strong><br>
-                <i>Note: Raw TiB is used for VVF/VCF licensing. Usable capacity depends on RAID policy.</i>
+                <i>Note: Raw TiB is used for VVF/VCF licensing. Usable capacity depends on RAID policy.</i>{rvtools_warn}
             </div>"""
         else:
-            vsan_html = """
+            vsan_html = f"""
             <div style="margin-top:10px; padding:8px; background:#e8f5e9; border:1px solid #c8e6c9; color:#2e7d32; border-radius:4px; font-size:0.9em;">
                 <strong>✅ vSAN/VxRail Detected in Source</strong><br>
-                <i>Note: Storage capacity planning for vSAN depends on RAID policy (RAID1/5/6) and is not calculated here.</i>
+                <i>Note: Storage capacity planning for vSAN depends on RAID policy (RAID1/5/6) and is not calculated here.</i>{rvtools_warn}
             </div>"""
 
     # Performance Display
@@ -197,13 +201,14 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
                 <div class="section-label">Future Requirement</div>
                 <div class="metric">{data['hosts_fut']} Hosts</div>
                 <div>Growth Model: {data['growth']*100:.0f}% Annually over {data['years']} Years</div>
+                <div>Efficiency: <strong>{data['ratio_fut']:.1f}:1</strong> vCPU:pCPU</div>
                 <div>Projected vCPU: {data['fut_vcpu']:,.0f}</div>
             </div>
         </div>
 
         <div class="card">
             <div class="section-label">Target Hardware Specification</div>
-            <div class="grid">
+            <div class="grid" style="grid-template-columns: 1fr 1fr 1fr;">
                 <div>
                     <div><strong>Per Node Config</strong></div>
                     <div>{data['sockets']} Sockets x {data['cores']} Cores</div>
@@ -214,6 +219,11 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
                     <div><strong>Cluster Capacity (Day 1)</strong></div>
                     <div>{data['hosts_now'] * data['host_cap_cores']} Total Cores</div>
                     <div>{data['hosts_now'] * data['ram']:,.0f} GB Total RAM</div>
+                </div>
+                <div>
+                    <div><strong>Cluster Capacity (Future)</strong></div>
+                    <div>{data['hosts_fut'] * data['host_cap_cores']} Total Cores</div>
+                    <div>{data['hosts_fut'] * data['ram']:,.0f} GB Total RAM</div>
                 </div>
             </div>
         </div>
@@ -252,6 +262,9 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
             </div>
             <div class="card">
                 <div class="section-label">Infrastructure</div>
+                <div style="font-size:0.8em; color:#666; margin-bottom:8px;">
+                    <i>Includes VMFS, NFS, and shared SAN/LUNs (excludes vSAN/VxRail).</i>
+                </div>
                 <table>
                     <tr><th>Total Capacity</th><td><strong>{data['ds_cap']:,.1f} TB</strong></td></tr>
                     <tr><th>Free Space</th><td><strong>{data['ds_free']:,.1f} TB</strong></td></tr>
@@ -305,10 +318,10 @@ def generate_html_report(data, scope_name, source_filename, customer_name, logo_
     return html
 
 # --- PROCESSORS ---
-def process_data(sheets, source_type, selected_clusters, include_off, perf_metric):
+def process_mapped_data(df_vm, df_h, df_ds, df_d, source_type, selected_clusters, include_off, maps):
     db = {
         'tot_vms': 0, 'tot_vcpu': 0, 'tot_ram': 0, 
-        'vinfo_prov': 0, 'vinfo_used': 0, 'bak_cons': 0,
+        'vinfo_prov': 0, 'vinfo_used': 0, 
         'cur_cores': 0, 'cur_host_count': 0, 'cur_total_ram_gb': 0, 'cur_lic_cores': 0,
         'max_vm_cpu': 0, 'max_vm_ram': 0, 'name_max_cpu': "N/A", 'name_max_ram': "N/A",
         'ds_cap': 0, 'ds_used': 0, 'ds_free': 0,
@@ -333,210 +346,211 @@ def process_data(sheets, source_type, selected_clusters, include_off, perf_metri
         return df
 
     # 1. VM Processing
-    df_vm = None
-    if source_type == "RVTools":
-        df_vm = promote_header(sheets['vInfo'], ["VM", "vInfoName"])
-        df_vm = apply_filter(df_vm, "Cluster", "Powerstate")
-        
-        cpu_col = get_col(df_vm, ['CPUs', 'vInfoCPUs'])
-        ram_col = get_col(df_vm, ['Memory', 'vInfoMemory'])
-        prov_col = get_col(df_vm, ['Provisioned MiB', 'vInfoProvisioned', 'Provisioned'])
-        used_col = get_col(df_vm, ['In Use MiB', 'vInfoInUse', 'In Use'])
-        
-        if cpu_col: db['tot_vcpu'] = to_float(df_vm[cpu_col]).sum()
-        if ram_col: db['tot_ram'] = get_rvtools_tb(df_vm, ram_col) * 1024 # Converts back to GB
-        if prov_col: db['vinfo_prov'] = get_rvtools_tb(df_vm, prov_col)
-        if used_col: db['vinfo_used'] = get_rvtools_tb(df_vm, used_col)
-        
-    elif source_type == "LiveOptics":
-        df_vm = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
-        df_vm = apply_filter(df_vm, "Cluster", "Power State")
-        
-        cpu_col = get_col(df_vm, ['Virtual CPU'])
-        ram_col = get_col(df_vm, ['Provisioned Memory (MiB)', 'Provisioned Memory'])
-        prov_col = get_col(df_vm, ['Virtual Disk Size (MiB)', 'Virtual Disk Size'])
-        used_col = get_col(df_vm, ['Virtual Disk Used (MiB)', 'Virtual Disk Used'])
-        
-        if cpu_col: db['tot_vcpu'] = to_float(df_vm[cpu_col]).sum()
-        if ram_col: db['tot_ram'] = to_float(df_vm[ram_col]).sum() / 1024
-        if prov_col: db['vinfo_prov'] = to_float(df_vm[prov_col]).sum() / 1048576
-        if used_col: db['vinfo_used'] = to_float(df_vm[used_col]).sum() / 1048576
-
-    if df_vm is not None:
+    if df_vm is not None and not df_vm.empty:
+        if maps['vm_cluster'] != "Not Found" and selected_clusters and "All Clusters" not in selected_clusters:
+            df_vm[maps['vm_cluster']] = df_vm[maps['vm_cluster']].fillna("Unclustered")
+            df_vm = df_vm[df_vm[maps['vm_cluster']].isin(selected_clusters)]
+            
+        if maps['vm_power'] != "Not Found" and not include_off:
+            df_vm = df_vm[df_vm[maps['vm_power']].astype(str).str.contains('poweredOn', case=False, na=False)]
+            
         db['tot_vms'] = len(df_vm)
-        c_col = cpu_col
-        m_col = ram_col
-        n_col = get_col(df_vm, ['VM', 'Name', 'vInfoName', 'VM Name'])
+        db['tot_vcpu'] = safe_sum(df_vm, maps['vm_cpu'])
         
-        if c_col: 
-            db['max_vm_cpu'] = to_float(df_vm[c_col]).max()
-            if n_col: db['name_max_cpu'] = df_vm.loc[to_float(df_vm[c_col]).idxmax(), n_col]
-        if m_col: 
-            raw_max_ram = to_float(df_vm[m_col]).max()
-            # If RVTools/LiveOptics, max ram is usually in MB/MiB
-            db['max_vm_ram'] = raw_max_ram / 1024 if raw_max_ram > 1000 else raw_max_ram
-            if n_col: db['name_max_ram'] = df_vm.loc[to_float(df_vm[m_col]).idxmax(), n_col]
+        # RAM Extraction
+        if maps['vm_ram'] != "Not Found":
+            cl = str(maps['vm_ram']).lower()
+            raw_ram = to_float(df_vm[maps['vm_ram']]).sum()
+            if 'tb' in cl or 'tib' in cl: db['tot_ram'] = raw_ram * 1024
+            elif 'gb' in cl or 'gib' in cl: db['tot_ram'] = raw_ram
+            elif 'kb' in cl or 'kib' in cl: db['tot_ram'] = raw_ram / 1048576
+            elif 'bytes' in cl or ' b' in cl: db['tot_ram'] = raw_ram / 1073741824
+            else: db['tot_ram'] = raw_ram / 1024
+            
+        # Provisioned Extraction
+        if maps['vm_prov'] != "Not Found":
+            cl = str(maps['vm_prov']).lower()
+            raw_prov = to_float(df_vm[maps['vm_prov']]).sum()
+            if 'tb' in cl or 'tib' in cl: db['vinfo_prov'] = raw_prov
+            elif 'gb' in cl or 'gib' in cl: db['vinfo_prov'] = raw_prov / 1024
+            elif 'kb' in cl or 'kib' in cl: db['vinfo_prov'] = raw_prov / 1073741824
+            elif 'bytes' in cl or ' b' in cl: db['vinfo_prov'] = raw_prov / 1099511627776
+            else: db['vinfo_prov'] = raw_prov / 1048576
+            
+        # Used Extraction
+        if maps['vm_used'] != "Not Found":
+            cl = str(maps['vm_used']).lower()
+            raw_used = to_float(df_vm[maps['vm_used']]).sum()
+            if 'tb' in cl or 'tib' in cl: db['vinfo_used'] = raw_used
+            elif 'gb' in cl or 'gib' in cl: db['vinfo_used'] = raw_used / 1024
+            elif 'kb' in cl or 'kib' in cl: db['vinfo_used'] = raw_used / 1073741824
+            elif 'bytes' in cl or ' b' in cl: db['vinfo_used'] = raw_used / 1099511627776
+            else: db['vinfo_used'] = raw_used / 1048576
+        
+        if maps['vm_cpu'] != "Not Found": 
+            db['max_vm_cpu'] = to_float(df_vm[maps['vm_cpu']]).max()
+            if maps['vm_name'] != "Not Found": 
+                db['name_max_cpu'] = df_vm.loc[to_float(df_vm[maps['vm_cpu']]).idxmax(), maps['vm_name']]
+                
+        if maps['vm_ram'] != "Not Found": 
+            raw_max_ram = to_float(df_vm[maps['vm_ram']]).max()
+            cl = str(maps['vm_ram']).lower()
+            if 'tb' in cl or 'tib' in cl: max_gb = raw_max_ram * 1024
+            elif 'gb' in cl or 'gib' in cl: max_gb = raw_max_ram
+            elif 'kb' in cl or 'kib' in cl: max_gb = raw_max_ram / 1048576
+            elif 'bytes' in cl or ' b' in cl: max_gb = raw_max_ram / 1073741824
+            else: max_gb = raw_max_ram / 1024
+            db['max_vm_ram'] = max_gb
+            
+            if maps['vm_name'] != "Not Found": 
+                db['name_max_ram'] = df_vm.loc[to_float(df_vm[maps['vm_ram']]).idxmax(), maps['vm_name']]
 
     # 2. Host Processing
-    df_h = None
     host_to_cluster = {}
-    
-    if source_type == "RVTools" and 'vHost' in sheets:
-        df_h = promote_header(sheets['vHost'], ["Host", "vHostName"])
-        
-        # Build map before filtering
-        nm_col = get_col(df_h, ['Host', 'vHostName'])
-        cl_col = get_col(df_h, ['Cluster', 'vHostCluster'])
-        if nm_col and cl_col:
-            host_to_cluster = pd.Series(df_h[cl_col].values, index=df_h[nm_col]).to_dict()
+    if df_h is not None and not df_h.empty:
+        if maps['h_name'] != "Not Found" and maps['h_cluster'] != "Not Found":
+            host_to_cluster = pd.Series(df_h[maps['h_cluster']].values, index=df_h[maps['h_name']]).to_dict()
             
-        df_h = apply_filter(df_h, "Cluster", None)
-        
-        h_cpu_col = get_col(df_h, ['# CPU', 'vHostNumCPU'])
-        h_core_col = get_col(df_h, ['Cores per CPU', 'vHostCoresPerCPU'])
-        h_mem_col = get_col(df_h, ['# Memory', 'vHostMemory'])
-        
-        if h_cpu_col and h_core_col:
-            db['cur_cores'] = (to_float(df_h[h_cpu_col]) * to_float(df_h[h_core_col])).sum()
-            if h_mem_col: db['cur_total_ram_gb'] = get_rvtools_tb(df_h, h_mem_col) * 1024
-            for _, row in df_h.iterrows():
-                db['cur_lic_cores'] += (float(row[h_cpu_col]) * max(float(row[h_core_col]), 16))
-
-    elif source_type == "LiveOptics" and 'ESX Hosts' in sheets:
-        df_h = promote_header(sheets['ESX Hosts'], ["Host Name", "CPU Cores"])
-        
-        nm_col = get_col(df_h, 'Host Name')
-        cl_col = get_col(df_h, 'Cluster')
-        if nm_col and cl_col:
-            host_to_cluster = pd.Series(df_h[cl_col].values, index=df_h[nm_col]).to_dict()
+        if maps['h_cluster'] != "Not Found" and selected_clusters and "All Clusters" not in selected_clusters:
+            df_h[maps['h_cluster']] = df_h[maps['h_cluster']].fillna("Unclustered")
+            df_h = df_h[df_h[maps['h_cluster']].isin(selected_clusters)]
             
-        df_h = apply_filter(df_h, "Cluster", None)
-        
-        h_core_col = get_col(df_h, 'CPU Cores')
-        h_mem_col = get_col(df_h, 'Memory')
-        if h_core_col: db['cur_cores'] = safe_sum(df_h, h_core_col)
-        if h_mem_col: db['cur_total_ram_gb'] = to_float(df_h[h_mem_col]).sum() / 1024 / 1024
-        
-        s_col = get_col(df_h, 'Socket')
-        c_col = get_col(df_h, 'Cores')
-        if s_col and c_col:
-            for _, row in df_h.iterrows():
-                try:
-                    s = float(row[s_col])
-                    c = float(row[c_col])
-                    if s > 0: db['cur_lic_cores'] += (s * max(c/s, 16))
-                except: pass
-    
-    if df_h is not None:
         db['cur_host_count'] = len(df_h)
+        
+        if maps['h_ram'] != "Not Found":
+            cl = str(maps['h_ram']).lower()
+            raw_h_ram = to_float(df_h[maps['h_ram']]).sum()
+            if 'tb' in cl or 'tib' in cl: db['cur_total_ram_gb'] = raw_h_ram * 1024
+            elif 'gb' in cl or 'gib' in cl: db['cur_total_ram_gb'] = raw_h_ram
+            elif 'kb' in cl or 'kib' in cl: db['cur_total_ram_gb'] = raw_h_ram / 1048576
+            elif 'bytes' in cl or ' b' in cl: db['cur_total_ram_gb'] = raw_h_ram / 1073741824
+            else: db['cur_total_ram_gb'] = raw_h_ram / 1024
+        
+        if source_type == "RVTools":
+            if maps['h_cpu'] != "Not Found" and maps['h_core'] != "Not Found":
+                db['cur_cores'] = (to_float(df_h[maps['h_cpu']]) * to_float(df_h[maps['h_core']])).sum()
+                for _, row in df_h.iterrows():
+                    db['cur_lic_cores'] += (float(row[maps['h_cpu']]) * max(float(row[maps['h_core']]), 16))
+        else:
+            if maps['h_core'] != "Not Found": db['cur_cores'] = safe_sum(df_h, maps['h_core'])
+            if maps['h_cpu'] != "Not Found" and maps['h_core'] != "Not Found":
+                for _, row in df_h.iterrows():
+                    try:
+                        s = float(row[maps['h_cpu']])
+                        c = float(row[maps['h_core']])
+                        if s > 0: db['cur_lic_cores'] += (s * max(c/s, 16))
+                    except: pass
 
-    # 3. Storage Processing (Datastores & vSAN)
-    if source_type == "RVTools" and 'vDatastore' in sheets:
-        df_ds = promote_header(sheets['vDatastore'], ["Capacity", "vDatastoreCapacity", "Name", "vDatastoreName"])
+    # 3. Storage Processing
+    def get_tb(df, col):
+        if col == "Not Found" or col not in df.columns: return 0.0
+        cl = str(col).lower()
+        val = to_float(df[col]).sum()
+        if 'tb' in cl or 'tib' in cl: return val
+        if 'gb' in cl or 'gib' in cl: return val / 1024
+        if 'kb' in cl or 'kib' in cl: return val / 1073741824
+        if 'bytes' in cl or ' b' in cl: return val / 1099511627776
+        return val / 1048576
         
-        cap_col = get_col(df_ds, ['Capacity MiB', 'vDatastoreCapacity', 'Capacity'])
-        free_col = get_col(df_ds, ['Free MiB', 'vDatastoreFreeSpace', 'Free'])
-        type_col = get_col(df_ds, ['Type', 'vDatastoreType'])
-        name_col = get_col(df_ds, ['Name', 'vDatastoreName'])
-        
-        # Map Datastores to Clusters via the "Hosts" list column
-        if selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
-            ds_h_col = get_col(df_ds, ['Hosts', 'vDatastoreHosts'])
-            if ds_h_col:
-                def map_cluster(hosts_str):
-                    if pd.isna(hosts_str): return "Unclustered"
-                    for h in str(hosts_str).split(','):
-                        h = h.strip()
-                        if h in host_to_cluster: return host_to_cluster[h]
-                        h_short = h.split('.')[0]
-                        for vh in host_to_cluster:
-                            if vh.startswith(h_short): return host_to_cluster[vh]
-                    return "Unclustered"
-                
-                df_ds['ClusterMap'] = df_ds[ds_h_col].apply(map_cluster)
-                df_ds = df_ds[df_ds['ClusterMap'].isin(selected_clusters)]
-                
+    if df_ds is not None and not df_ds.empty:
+        if maps['ds_hosts'] != "Not Found" and selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
+            def map_cluster(hosts_str):
+                if pd.isna(hosts_str): return "Unclustered"
+                for h in str(hosts_str).split(','):
+                    h = h.strip()
+                    if h in host_to_cluster: return host_to_cluster[h]
+                    h_short = h.split('.')[0]
+                    for vh in host_to_cluster:
+                        if vh.startswith(h_short): return host_to_cluster[vh]
+                return "Unclustered"
+            
+            df_ds['ClusterMap'] = df_ds[maps['ds_hosts']].apply(map_cluster)
+            df_ds = df_ds[df_ds['ClusterMap'].isin(selected_clusters)]
+            
         mask_vsan = pd.Series([False]*len(df_ds), index=df_ds.index)
-        if type_col:
-            mask_vsan = mask_vsan | (df_ds[type_col].astype(str).str.lower() == 'vsan')
-        if name_col:
-            mask_vsan = mask_vsan | (df_ds[name_col].astype(str).str.contains('vsan|vxrail', case=False, na=False))
+        if maps['ds_type'] != "Not Found":
+            mask_vsan = mask_vsan | (df_ds[maps['ds_type']].astype(str).str.lower() == 'vsan')
+        if maps['ds_name'] != "Not Found":
+            mask_vsan = mask_vsan | (df_ds[maps['ds_name']].astype(str).str.contains('vsan|vxrail', case=False, na=False))
             
         vsan_ds = df_ds[mask_vsan]
         if not vsan_ds.empty:
             db['vsan_detected'] = True
-            db['vsan_raw_tib'] = get_rvtools_tb(vsan_ds, cap_col)
+            db['vsan_raw_tib'] = get_tb(vsan_ds, maps['ds_cap'])
             
         df_san = df_ds[~mask_vsan]
-        db['ds_cap'] = get_rvtools_tb(df_san, cap_col)
-        db['ds_free'] = get_rvtools_tb(df_san, free_col)
-        db['ds_used'] = db['ds_cap'] - db['ds_free']
+        db['ds_cap'] = get_tb(df_san, maps['ds_cap'])
+        if maps['ds_free'] != "Not Found":
+            db['ds_free'] = get_tb(df_san, maps['ds_free'])
+        if maps['ds_used'] != "Not Found":
+            db['ds_used'] = get_tb(df_san, maps['ds_used'])
+        else:
+            db['ds_used'] = db['ds_cap'] - db['ds_free']
 
-    elif source_type == "LiveOptics":
-        # Live Optics Disk Processing (vSAN Raw)
-        disk_tab = next((k for k in sheets.keys() if 'disks' in k.lower() and 'vm' not in k.lower()), None)
-        if disk_tab:
-            try:
-                df_d = promote_header(sheets[disk_tab], ["Model", "Capacity"])
-                if selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
-                    srv_col = get_col(df_d, ['Server', 'Host'])
-                    if srv_col:
-                        def map_lo_cluster(h):
-                            if pd.isna(h): return "Unclustered"
-                            h = str(h).strip()
-                            if h in host_to_cluster: return host_to_cluster[h]
-                            h_short = h.split('.')[0]
-                            for vh in host_to_cluster:
-                                if vh.startswith(h_short): return host_to_cluster[vh]
-                            return "Unclustered"
-                        df_d['ClusterMap'] = df_d[srv_col].apply(map_lo_cluster)
-                        df_d = df_d[df_d['ClusterMap'].isin(selected_clusters)]
+    # Live Optics specific vSAN parsing from disks
+    if df_d is not None and not df_d.empty:
+        if maps['d_host'] != "Not Found" and selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
+            def map_lo_cluster(h):
+                if pd.isna(h): return "Unclustered"
+                h = str(h).strip()
+                if h in host_to_cluster: return host_to_cluster[h]
+                h_short = h.split('.')[0]
+                for vh in host_to_cluster:
+                    if vh.startswith(h_short): return host_to_cluster[vh]
+                return "Unclustered"
+            df_d['ClusterMap'] = df_d[maps['d_host']].apply(map_lo_cluster)
+            df_d = df_d[df_d['ClusterMap'].isin(selected_clusters)]
+            
+        if maps['d_model'] != "Not Found" and maps['d_cap'] != "Not Found":
+            bad_keywords = 'BOSS|USB|SD|RAID|PERC|Virtual|DVD|CD-ROM|DELL Disk|Cisco Disk'
+            mask_logical = df_d[maps['d_model']].astype(str).str.contains(bad_keywords, case=False, na=False)
+            df_d['TiB'] = df_d[maps['d_cap']].apply(lambda x: to_float(pd.Series([x])).iloc[0] / 1048576)
+            mask_small = df_d['TiB'] < 0.3 
+            
+            df_clean = df_d[~mask_logical & ~mask_small].copy()
+            if not df_clean.empty:
+                grp = df_clean.groupby([maps['d_model']]).agg({'TiB': 'sum', maps['d_model']: 'count'}).rename(columns={maps['d_model']: 'Count'})
+                winner = grp.loc[grp['TiB'].idxmax()]
                 
-                c_mod = get_col(df_d, 'Model')
-                c_cap = get_col(df_d, 'Capacity')
-                
-                if c_mod and c_cap:
-                    bad_keywords = 'BOSS|USB|SD|RAID|PERC|Virtual|DVD|CD-ROM|DELL Disk|Cisco Disk'
-                    mask_logical = df_d[c_mod].astype(str).str.contains(bad_keywords, case=False, na=False)
-                    df_d['TiB'] = to_float(df_d[c_cap]) / 1048576
-                    mask_small = df_d['TiB'] < 0.3 
-                    
-                    df_clean = df_d[~mask_logical & ~mask_small].copy()
-                    if not df_clean.empty:
-                        grp = df_clean.groupby([c_mod]).agg({'TiB': 'sum', c_mod: 'count'}).rename(columns={c_mod: 'Count'})
-                        winner = grp.loc[grp['TiB'].idxmax()]
-                        
-                        avg_disks = winner['Count'] / db['cur_host_count'] if db['cur_host_count'] else 0
-                        if avg_disks > 1.0:
-                            db['vsan_detected'] = True
-                            db['vsan_raw_tib'] = winner['TiB']
-            except: pass
-
-        # Live Optics LUNs
-        if 'Host Devices' in sheets:
-            df_dev = promote_header(sheets['Host Devices'], ["Device Name", "Capacity"])
-            if selected_clusters and "All Clusters" not in selected_clusters and host_to_cluster:
-                srv_col = get_col(df_dev, ['Server', 'Host'])
-                if srv_col:
-                    df_dev['ClusterMap'] = df_dev[srv_col].map(host_to_cluster)
-                    df_dev = df_dev[df_dev['ClusterMap'].isin(selected_clusters)]
-
-            type_col = get_col(df_dev, 'Type')
-            if type_col:
-                df_shared = df_dev[df_dev[type_col].astype(str).str.contains('Cluster', case=False, na=False)]
-                cap_col = get_col(df_shared, 'Capacity')
-                used_col = get_col(df_shared, 'Used')
-                
-                if cap_col: db['ds_cap'] = to_float(df_shared[cap_col]).sum() / 1024
-                if used_col: db['ds_used'] = to_float(df_shared[used_col]).sum() / 1024 
-                db['ds_free'] = db['ds_cap'] - db['ds_used']
+                avg_disks = winner['Count'] / db['cur_host_count'] if db['cur_host_count'] else 0
+                if avg_disks > 1.0:
+                    db['vsan_detected'] = True
+                    db['vsan_raw_tib'] = winner['TiB']
 
     return db
+
+# --- MAPPING CONFIGURATION ---
+REQ_MAPS = {
+    "vm_name": {"df": "vm", "kws": ['VM Name', 'VM', 'vInfoName', 'Name']},
+    "vm_cluster": {"df": "vm", "kws": ['Cluster', 'vInfoCluster']},
+    "vm_power": {"df": "vm", "kws": ['Power State', 'Powerstate']},
+    "vm_cpu": {"df": "vm", "kws": ['Virtual CPU', 'CPUs', 'vInfoCPUs']},
+    "vm_ram": {"df": "vm", "kws": ['Provisioned Memory', 'Memory', 'vInfoMemory']},
+    "vm_prov": {"df": "vm", "kws": ['Virtual Disk Size', 'Provisioned', 'vInfoProvisioned']},
+    "vm_used": {"df": "vm", "kws": ['Virtual Disk Used', 'In Use', 'vInfoInUse']},
+    
+    "h_name": {"df": "h", "kws": ['Host Name', 'Host', 'vHostName', 'Server']},
+    "h_cluster": {"df": "h", "kws": ['Cluster', 'vHostCluster']},
+    "h_cpu": {"df": "h", "kws": ['CPU Sockets', '# CPU', 'vHostNumCPU', 'Socket']},
+    "h_core": {"df": "h", "kws": ['CPU Cores', 'Cores per CPU', 'vHostCoresPerCPU', 'Cores']},
+    "h_ram": {"df": "h", "kws": ['Memory', '# Memory', 'vHostMemory']},
+    
+    "ds_name": {"df": "ds", "kws": ['Device Name', 'Name', 'vDatastoreName']},
+    "ds_cap": {"df": "ds", "kws": ['Capacity', 'vDatastoreCapacity']},
+    "ds_used": {"df": "ds", "kws": ['Used Capacity', 'Used', 'In Use', 'vDatastoreInUse']},
+    "ds_free": {"df": "ds", "kws": ['Free Capacity', 'Free', 'vDatastoreFreeSpace']},
+    "ds_hosts": {"df": "ds", "kws": ['Server', 'Host', 'Hosts', 'vDatastoreHosts']},
+    "ds_type": {"df": "ds", "kws": ['Device Type', 'Type', 'vDatastoreType']},
+    
+    "d_host": {"df": "d", "kws": ['Server', 'Host']},
+    "d_model": {"df": "d", "kws": ['Model', 'Disk Model']},
+    "d_cap": {"df": "d", "kws": ['Capacity', 'Disk Capacity']}
+}
 
 # --- MAIN APP ---
 st.sidebar.title("⚙️ Parameters")
 
-# 1. CLUSTER SLOT (Placeholder for dynamic content)
+# 1. CLUSTER SLOT
 cluster_slot = st.sidebar.empty()
 
 # 2. HARDWARE
@@ -576,31 +590,54 @@ if uploaded_files:
         sheets = pd.read_excel(file_map[sel_file], sheet_name=None, header=None, engine='openpyxl')
         sheets = clean_sheet_names(sheets)
         
-        # Detect
+        # Detect Source & Promote Headers
         src_type = "Unknown"
-        df_clus = None
+        df_vm = df_h = df_ds = df_d = None
+        
         if 'vInfo' in sheets:
             src_type = "RVTools"
-            df_clus = promote_header(sheets['vInfo'], ["VM", "vInfoName"])
+            df_vm = promote_header(sheets['vInfo'], ["VM", "vInfoName", "Powerstate"])
+            df_h = promote_header(sheets.get('vHost', pd.DataFrame()), ["Host", "vHostName"])
+            df_ds = promote_header(sheets.get('vDatastore', pd.DataFrame()), ["Capacity", "vDatastoreCapacity", "Name"])
+            df_d = pd.DataFrame()
+            
         elif 'VMs' in sheets:
             src_type = "LiveOptics"
-            df_clus = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
+            df_vm = promote_header(sheets['VMs'], ["VM Name", "Guest Hostname"])
+            df_h = promote_header(sheets.get('ESX Hosts', pd.DataFrame()), ["Host Name", "CPU Cores"])
+            df_ds = promote_header(sheets.get('Host Devices', pd.DataFrame()), ["Device Name", "Capacity"])
+            disk_tab = next((k for k in sheets.keys() if 'disks' in k.lower() and 'vm' not in k.lower()), None)
+            if disk_tab: df_d = promote_header(sheets[disk_tab], ["Model", "Capacity"])
         else:
             st.error("Invalid File Format")
             st.stop()
             
         st.success(f"📂 **{src_type}** Detected")
         
-        # --- CHECKBOX LIST SELECTION ---
-        clus_col = get_col(df_clus, ["Cluster", "vInfoCluster"])
-        selected_clusters = []
+        df_map = {"vm": df_vm, "h": df_h, "ds": df_ds, "d": df_d}
+
+        # --- DYNAMIC FIELD MAPPING UI ---
+        maps = {}
+        with st.sidebar.expander("🛠️ Data Field Mapping", expanded=False):
+            st.caption("If a metric shows 0, fix the column mapping here.")
+            for key, conf in REQ_MAPS.items():
+                df_target = df_map.get(conf["df"])
+                if df_target is not None and not df_target.empty:
+                    cols = ["Not Found"] + df_target.columns.tolist()
+                    auto_c = get_col(df_target, conf["kws"])
+                    idx = cols.index(auto_c) if auto_c in cols else 0
+                    maps[key] = st.selectbox(key.replace("_", " ").title(), cols, index=idx, key=f"map_{key}")
+                else:
+                    maps[key] = "Not Found"
         
+        # --- CLUSTER SELECTION ---
+        selected_clusters = []
         with cluster_slot.container():
             st.subheader("Cluster Scope")
+            clus_col = maps['vm_cluster']
             
-            if clus_col:
-                all_clusters = sorted(df_clus[clus_col].fillna("Unclustered").astype(str).unique())
-                
+            if clus_col != "Not Found" and df_vm is not None:
+                all_clusters = sorted(df_vm[clus_col].fillna("Unclustered").astype(str).unique())
                 if not all_clusters:
                     st.caption("No clusters found. Using global scope.")
                     selected_clusters = ["All Clusters"]
@@ -611,14 +648,14 @@ if uploaded_files:
                             selected_clusters.append(c)
             else:
                 selected_clusters = ["All Clusters"]
-                st.caption("No Cluster column found. Using global scope.")
+                st.caption("No Cluster column mapped. Using global scope.")
 
         if not selected_clusters:
             st.warning("⚠️ Please select at least one cluster in the sidebar.")
             st.stop()
             
-        # Process
-        db = process_data(sheets, src_type, selected_clusters, include_off, "95th")
+        # Process Mapped Data
+        db = process_mapped_data(df_vm, df_h, df_ds, df_d, src_type, selected_clusters, include_off, maps)
         
         # Sizing Math
         eff_cores = host_cap_cores * (1 - cpu_buffer/100)
@@ -635,11 +672,15 @@ if uploaded_files:
             raw_hosts = req_ram
         
         mult = (1+growth)**years
-        fut_hosts = math.ceil(max((db['tot_vcpu']*mult)/vcpu_ratio/eff_cores, (db['tot_ram']*mult)/eff_ram))
+        fut_vcpu = db['tot_vcpu'] * mult
+        fut_hosts = math.ceil(max(fut_vcpu / vcpu_ratio / eff_cores, (db['tot_ram'] * mult) / eff_ram))
         
         hosts_now = max(int(raw_hosts) + ha_nodes, min_hosts)
         hosts_fut = max(int(fut_hosts) + ha_nodes, min_hosts)
         
+        ratio_now = db['tot_vcpu'] / (hosts_now * host_cap_cores) if hosts_now else 0
+        ratio_fut = fut_vcpu / (hosts_fut * host_cap_cores) if hosts_fut else 0
+
         # Licensing Calc
         lic_per_node = calc_license_cores(tgt_sockets, tgt_cores)
         now_lic = hosts_now * lic_per_node
@@ -648,12 +689,13 @@ if uploaded_files:
         # Report Pkg
         rpt = db.copy()
         rpt.update({
+            'src_type': src_type,
             'hosts_now': hosts_now, 'hosts_fut': hosts_fut, 'constraint': constraint,
             'raw_hosts': raw_hosts, 'ha_nodes': ha_nodes, 'sockets': tgt_sockets, 'cores': tgt_cores, 'ram': tgt_ram,
             'tgt_numa_cores': tgt_cores, 'tgt_numa_ram': tgt_ram/tgt_sockets, 'growth': growth, 'years': years,
-            'ratio_now': db['tot_vcpu']/(hosts_now*host_cap_cores) if hosts_now else 0,
+            'ratio_now': ratio_now, 'ratio_fut': ratio_fut,
             'cur_ratio': db['tot_vcpu']/db['cur_cores'] if db['cur_cores'] > 0 else 0,
-            'lo_basis': "95th", 'host_cap_cores': host_cap_cores, 'fut_vcpu': db['tot_vcpu']*mult,
+            'lo_basis': "95th", 'host_cap_cores': host_cap_cores, 'fut_vcpu': fut_vcpu,
             'now_lic_cores': now_lic, 'fut_lic_cores': fut_lic, 'lic_diff': fut_lic - db['cur_lic_cores']
         })
         
@@ -698,7 +740,9 @@ if uploaded_files:
                 st.markdown("#### 🔧 Hardware Specs")
                 st.write(f"**Per Node:** {tgt_sockets} Sockets | {host_cap_cores} Cores | {tgt_ram} GB RAM")
                 st.write(f"**Cluster Total:** {hosts_fut * host_cap_cores} Cores | {hosts_fut * tgt_ram:,.0f} GB RAM")
-            
+                st.markdown("#### 📉 CPU Oversubscription")
+                st.metric("Efficiency (vCPU:pCPU)", f"{rpt['ratio_fut']:.1f}:1", help="Projected Cluster Efficiency (including HA nodes)")
+
             st.subheader(f"2. Workload Scope")
             st.caption(f"Consolidating: {scope_str}")
             with st.container(border=True):
@@ -718,6 +762,7 @@ if uploaded_files:
             with c_infra:
                 with st.container(border=True):
                     st.markdown(f"#### 🏢 Infrastructure")
+                    st.caption("Includes VMFS, NFS, and shared SAN/LUNs (excludes vSAN/VxRail).")
                     st.write(f"**Total Capacity:** {db['ds_cap']:,.1f} TB")
                     st.write(f"**Allocated:** {db['ds_used']:,.1f} TB")
                     st.write(f"**Free:** {db['ds_free']:,.1f} TB")
@@ -730,6 +775,9 @@ if uploaded_files:
                             st.caption("Note: Raw TiB is used for VVF/VCF Licensing. Usable capacity depends on RAID policy.")
                         else:
                             st.caption("One or more selected clusters contain vSAN-signature disks.")
+                            
+                        if src_type == "RVTools":
+                            st.caption("⚠️ **Note:** The RVTools vSAN capacity estimate excludes the cache tier and formatting overhead. A hardware BOM or Live Optics run is required for down-to-the-byte licensing accuracy.")
 
             st.subheader("4. Architecture & NUMA")
             st.write(f"**Target NUMA:** {tgt_cores} Cores | {tgt_ram/tgt_sockets:.0f} GB RAM")
@@ -757,7 +805,10 @@ if uploaded_files:
             
         with t2:
             st.write("Source Data Preview")
-            st.dataframe(db.get('df_raw_vinfo'))
+            if df_vm is not None:
+                st.dataframe(df_vm)
+            else:
+                st.info("No raw data available.")
 
     except Exception as e:
         st.error("⚠️ Error Processing File")
