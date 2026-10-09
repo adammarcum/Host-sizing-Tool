@@ -1527,7 +1527,10 @@ def render_checks(checks):
 
 
 def section_title(eyebrow_text, title):
-    st.space("medium") if hasattr(st, "space") else st.write("")
+    if hasattr(st, "space"):          # Streamlit >= 1.51
+        st.space("medium")
+    else:
+        st.html("<div style='height:18px'></div>")
     eyebrow(eyebrow_text)
     st.subheader(title, anchor=False)
 
