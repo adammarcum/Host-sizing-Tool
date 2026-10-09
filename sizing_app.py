@@ -1491,6 +1491,12 @@ def build_context():
 
 
 # ---------- shared UI pieces ----------
+def seg_width(options):
+    """Fixed pixel width for a segmented control. Streamlit sizes 'content' width before the
+    Poppins web font loads, so the wider font can push the last button onto a second line."""
+    return int(sum(len(str(o)) * 9.5 + 40 for o in options) + 12)
+
+
 def kv_html(rows):
     cells = "".join(
         f"<tr><td>{escape(str(k))}</td><td class='{'red' if w == 'red' else ('warn' if w else '')}'>"
@@ -1921,6 +1927,7 @@ def render_parameters(ctx):
                                       ":material/trending_up: Scope & growth"])
         with t0:
             st.segmented_control("Target hypervisor", list(HYPERVISORS), key="hypervisor", on_change=_apply_hv_ratio,
+                                 width=seg_width(HYPERVISORS),
                                  help="Choosing a hypervisor sets the design limit to its vCPU:pCPU guidance. "
                                       "Ratios above the guidance are flagged in bold red.")
             hv = st.session_state.hypervisor or DEFAULT_HYPERVISOR
@@ -1947,7 +1954,7 @@ def render_parameters(ctx):
             c[2].number_input("RAM / host (GB)", 64, 8192, key="ram")
             c[3].number_input("CPU speed (GHz)", 1.0, 5.0, key="clock", help="Used for Live Optics performance sizing")
             st.segmented_control(
-                "Live Optics basis", ["95th Percentile", "Peak CPU", "Average CPU"], key="lo_basis",
+                "Live Optics basis", ["95th Percentile", "Peak CPU", "Average CPU"], key="lo_basis", width=seg_width(["95th Percentile", "Peak CPU", "Average CPU"]),
                 disabled=ctx["source"] != "LiveOptics",
                 help=f"GHz demand used for performance sizing. '95th' is estimated as {LO_95TH_FALLBACK:.0%} "
                      "of Peak if the column is missing. Live Optics files only.")
@@ -2041,6 +2048,7 @@ def page_recommendation():
     day1_col = "Proposed (Day 1)" if r["override_now"] else "Recommended (Day 1)"
     fut_col = f"Future ({r['years']} yrs)"
     view = st.segmented_control("Compare", ["Day 1", "Future", "Both"], key="cmp_view",
+                                width=seg_width(["Day 1", "Future", "Both"]),
                                 label_visibility="collapsed") or DEFAULTS["cmp_view"]
     cols = ["Metric", "Current"] + ([day1_col] if view in ("Day 1", "Both") else []) + \
            ([fut_col] if view in ("Future", "Both") else [])
@@ -2150,9 +2158,11 @@ def page_raw():
     if not ctx:
         return
     page_header("Raw Data", context_subtitle(ctx), ctx)
-    c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="bottom")
-    view = c1.segmented_control("Dataset", ["VMs", "Hosts"], key="raw_view") or DEFAULTS["raw_view"]
-    cols_mode = c2.segmented_control("Columns", ["Key columns", "All columns"], key="raw_cols") or DEFAULTS["raw_cols"]
+    c1, c2, c3 = st.columns([1, 1.4, 2], vertical_alignment="bottom")
+    view = c1.segmented_control("Dataset", ["VMs", "Hosts"], key="raw_view",
+                                width=seg_width(["VMs", "Hosts"])) or DEFAULTS["raw_view"]
+    cols_mode = c2.segmented_control("Columns", ["Key columns", "All columns"], key="raw_cols",
+                                     width=seg_width(["Key columns", "All columns"])) or DEFAULTS["raw_cols"]
     query = c3.text_input("Search", key="raw_search", icon=":material/search:", placeholder="Filter rows...")
 
     df = ctx["inv"]["raw_vms"] if view == "VMs" else ctx["inv"]["raw_hosts"]
