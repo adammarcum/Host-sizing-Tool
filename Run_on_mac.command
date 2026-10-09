@@ -47,4 +47,5 @@ fi
 # 5. Launch
 echo ""
 echo "Launching... your browser will open shortly. Close this window to stop the app."
+"$VENV/bin/python" sizing_app.py --setup >/dev/null 2>&1   # installs the AHEAD theme (.streamlit/config.toml)
 exec "$VENV/bin/python" -m streamlit run sizing_app.py

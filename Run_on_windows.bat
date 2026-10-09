@@ -27,5 +27,7 @@ if errorlevel 1 (
 )
 
 echo Launching... your browser will open shortly. Close this window to stop the app.
+REM Install the AHEAD theme (.streamlit\config.toml)
+".venv\Scripts\python.exe" sizing_app.py --setup >nul 2>&1
 ".venv\Scripts\python.exe" -m streamlit run sizing_app.py
 pause
