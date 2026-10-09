@@ -1,49 +1,50 @@
 #!/bin/bash
+# Virtualization Sizing Calculator - macOS launcher
+# First run: installs dependencies into a private .venv folder. Every run: launches the app.
+cd "$(dirname "$0")" || exit 1
 clear
 echo "==========================================="
-echo "   RVTools Sizer - Automated Installer"
+echo "   Virtualization Sizing Calculator"
 echo "==========================================="
 echo ""
 
-# 1. Check for Apple Command Line Tools (Required for Pip)
-echo "[1/3] Checking Apple Developer Tools..."
-if xcode-select -p &>/dev/null; then
-    echo "      ✅ Tools found."
-else
-    echo "      ❌ Tools missing. Requesting install..."
-    echo "      ⚠️ A POPUP WINDOW WILL APPEAR. PLEASE CLICK 'INSTALL'."
+# 1. Apple Command Line Tools (provides python3 on a clean Mac)
+if ! xcode-select -p &>/dev/null; then
+    echo "[setup] Apple Developer Tools missing. A popup will appear - click 'Install'."
     xcode-select --install
-    
-    # Wait loop until user installs
-    echo "      Waiting for installation to finish..."
-    while ! xcode-select -p &>/dev/null; do
-        sleep 5
-    done
-    echo "      ✅ Tools installed successfully."
+    echo "        Waiting for installation to finish..."
+    until xcode-select -p &>/dev/null; do sleep 5; done
 fi
 
-echo ""
-
-# 2. Check Python
-echo "[2/3] Checking Python Environment..."
-if command -v python3 &>/dev/null; then
-    echo "      ✅ Python3 found."
-else
-    echo "      ❌ Python3 not found. macOS usually comes with it."
-    echo "      Please install Python from python.org if this fails."
+# 2. Python
+if ! command -v python3 &>/dev/null; then
+    echo "Python 3 not found. Install it from https://www.python.org/downloads/ and re-run."
+    read -r -p "Press [Enter] to close..."
     exit 1
 fi
 
-echo ""
+# 3. Private virtual environment (avoids 'externally-managed-environment' errors)
+VENV=".venv"
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "[setup] Creating Python environment (first run only)..."
+    python3 -m venv "$VENV" || { echo "Failed to create virtual environment."; read -r -p "Press [Enter]..."; exit 1; }
+fi
 
-# 3. Install Libraries
-echo "[3/3] Installing Sizer Libraries (Streamlit, Pandas)..."
-pip3 install --user streamlit pandas openpyxl
+# 4. Install / update libraries only when requirements.txt changes
+STAMP="$VENV/.requirements.installed"
+if [ ! -f "$STAMP" ] || ! cmp -s requirements.txt "$STAMP"; then
+    echo "[setup] Installing libraries (Streamlit, Pandas, OpenPyXL)..."
+    "$VENV/bin/python" -m pip install --quiet --upgrade pip
+    if "$VENV/bin/python" -m pip install --quiet -r requirements.txt; then
+        cp requirements.txt "$STAMP"
+    else
+        echo "Library install failed. Check your network/proxy and re-run."
+        read -r -p "Press [Enter] to close..."
+        exit 1
+    fi
+fi
 
+# 5. Launch
 echo ""
-echo "==========================================="
-echo "   🎉 Installation Complete!"
-echo "   You can now double-click 'Sizing Calculator' to run."
-echo "==========================================="
-echo ""
-read -p "Press [Enter] to close..."
+echo "Launching... your browser will open shortly. Close this window to stop the app."
+exec "$VENV/bin/python" -m streamlit run sizing_app.py
