@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.4)
+# 📊 Virtualization Sizing Calculator (v3.5)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.4
+**Version:** 3.5
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -84,6 +84,7 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * `sizing_app.py`: The application.
 * `requirements.txt`: Required Python libraries.
 * `ahead_logo.png` / `ahead_logo_white.png`: AHEAD logos (light / dark backgrounds) embedded in the app and report.
+* `host_sizer_logo_white.png` / `host_sizer_icon.png`: Host Sizer logo for the sidebar and browser tab.
 * `Run_on_windows.bat`: Windows installer + launcher.
 * `Run_on_mac.command`: macOS installer + launcher.
 * `Host Sizing Calculator.app`: Mac double-click shortcut that runs `Run_on_mac.command`.
@@ -98,6 +99,9 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.5**
+* Host Sizer logo (draft, pending Brand Marketing review) in the sidebar and as the browser-tab icon. The HTML report is unchanged.
 
 **3.4**
 * Easier first run. The Windows launcher finds a real Python (ignoring the Microsoft Store placeholder), checks standard install folders, and offers to install Python 3.12 with winget; otherwise it opens python.org. The Mac launcher prefers a newer python.org/Homebrew Python, falls back to Apple's, and installs the Command Line Tools when needed.

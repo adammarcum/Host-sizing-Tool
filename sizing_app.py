@@ -30,10 +30,12 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
+PRODUCT_LOGO_PATH = os.path.join(APP_DIR, "host_sizer_logo_white.png")  # Host Sizer lockup (dark sidebar)
+PRODUCT_ICON_PATH = os.path.join(APP_DIR, "host_sizer_icon.png")        # browser-tab icon
 
 ALL_CLUSTERS = "All Clusters"
 LIC_MIN_CORES_PER_SOCKET = 16   # VMware per-core licensing minimum per CPU
@@ -1306,6 +1308,7 @@ gatherUsageStats = false
 
 APP_CSS = """<style>
 .hs-brand { padding: 2px 2px 18px; margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,.12); }
+.hs-brand img.lockup { width: 100%; max-width: 230px; height: auto; display: block; }
 .hs-brand .name { font-size: 30px; font-weight: 700; color: #FFFFFF; line-height: 1.05; letter-spacing: -.01em; }
 .hs-brand .pb { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.8); }
 .hs-brand .pb img { height: 11px; display: block; }
@@ -1796,9 +1799,14 @@ def render_saved_projects():
 # ---------- sidebar ----------
 def render_sidebar():
     sb = st.sidebar
-    logo = file_data_uri(WHITE_LOGO_PATH)
-    pb = f"Powered by <img src='{logo}' alt='AHEAD'>" if logo else "Powered by AHEAD"
-    sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div></div>")
+    product_logo = file_data_uri(PRODUCT_LOGO_PATH)
+    if product_logo:
+        sb.html(f"<div class='hs-brand'><img class='lockup' src='{product_logo}' "
+                f"alt='{escape(PRODUCT_NAME)} - Powered by AHEAD'></div>")
+    else:  # fallback if the logo file is missing
+        logo = file_data_uri(WHITE_LOGO_PATH)
+        pb = f"Powered by <img src='{logo}' alt='AHEAD'>" if logo else "Powered by AHEAD"
+        sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div></div>")
 
     has_report = CTX is not None and not CTX.get("error")
     sb.html("<div class='hs-label'>Workspace</div>")
@@ -2184,7 +2192,8 @@ def page_raw():
 # ---------- entry point ----------
 def main():
     global CTX
-    st.set_page_config(page_title=f"{PRODUCT_NAME} | AHEAD", layout="wide", page_icon=":material/dns:")
+    st.set_page_config(page_title=f"{PRODUCT_NAME} | AHEAD", layout="wide",
+                       page_icon=PRODUCT_ICON_PATH if os.path.exists(PRODUCT_ICON_PATH) else ":material/dns:")
     version = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit())
     if version < MIN_STREAMLIT:
         st.error(f"{PRODUCT_NAME} needs Streamlit {'.'.join(map(str, MIN_STREAMLIT))} or newer; this computer has "
