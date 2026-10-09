@@ -30,7 +30,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -1299,6 +1299,9 @@ secondaryBackgroundColor = "#1B2E45"
 textColor = "#FFFFFF"
 primaryColor = "#67C3E9"
 borderColor = "#2B3F58"
+
+[browser]
+gatherUsageStats = false
 """
 
 APP_CSS = """<style>
@@ -1375,6 +1378,19 @@ def ensure_theme_config():
         return True
     except OSError:
         return False
+
+
+def ensure_streamlit_credentials():
+    """Create ~/.streamlit/credentials.toml (blank email) so Streamlit's first-run
+    'Email:' prompt doesn't stall the launcher window. Never overwrites an existing file."""
+    path = os.path.join(os.path.expanduser("~"), ".streamlit", "credentials.toml")
+    try:
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('[general]\nemail = ""\n')
+    except OSError:
+        pass
 
 
 def init_state():
@@ -2189,6 +2205,7 @@ def main():
 if __name__ == "__main__":
     if "--setup" in sys.argv:
         ensure_theme_config()
+        ensure_streamlit_credentials()
         print("AHEAD theme config is in place.")
     else:
         main()

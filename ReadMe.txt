@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.3)
+# 📊 Virtualization Sizing Calculator (v3.4)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.3
+**Version:** 3.4
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -9,23 +9,34 @@ A unified infrastructure sizing tool designed for Solutions Architects. It inges
 
 ## 🚀 Quick Start (For Users)
 
-**No coding knowledge required.**
+**No coding knowledge required. Nothing to install by hand.**
 
-1.  **Download the Tool:**
-    * Click the green **<> Code** button above, select **Download ZIP**, and extract it (e.g., to Documents).
-    * Keep all files together in the same folder (`sizing_app.py`, `requirements.txt`, both `ahead_logo` files, launchers).
+1.  **Download and unzip** the tool into a normal folder (e.g. Documents). Keep all the files together.
 
-2.  **Launch:**
-    * **Windows:** Double-click `Run_on_windows.bat`.
-    * **Mac:** Double-click `Run_on_mac.command`.
-        * If macOS says it can't be opened, right-click the file and choose **Open**. If it says "permission denied", run `chmod +x Run_on_mac.command` once in Terminal.
+2.  **Double-click the launcher for your computer:**
 
-    The first run creates a private Python environment (`.venv`) and installs the libraries; later runs start immediately. Your browser opens automatically. Close the terminal window to stop the app.
+    | Computer | Double-click | First time only |
+    |---|---|---|
+    | **Windows** | `Run_on_windows.bat` | If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**. If Python isn't installed, the launcher offers to install it for you (answer **Y**). |
+    | **Mac** | `Host Sizing Calculator.app` (or `Run_on_mac.command`) | If macOS says it's from an *unidentified developer*, **right-click → Open → Open**. If Python isn't installed, click **Install** on the macOS popup. |
 
-3.  **Use:**
+3.  **Wait for your browser to open.** The first run downloads the libraries (about 100 MB, a few minutes). Later runs start in seconds and work offline. Keep the black/Terminal window open while you use the tool; close it to stop.
+
+4.  **Use the tool:**
     * On **Home**, upload one or more **RVTools.xlsx** or **Live Optics.xlsx** files. Each appears as a tile; click **Open** to work on it, or switch the active report in the sidebar.
     * Review **Current Environment**, tune the sizing on **Recommendation**, set the customer name/logo on **Report**, then click **Download report**.
     * Click **Save project** to keep the sizing. Saved projects appear on **Home** under *Your project library* and reopen with all settings.
+
+### 🧰 If something goes wrong
+
+| What you see | What to do |
+|---|---|
+| *"The libraries could not be downloaded"* | You need internet for the first run. Connect (and join VPN if required) and try again. A proxy may be blocking `pypi.org` / `files.pythonhosted.org` - ask your eTech team to allow them. |
+| Mac: *"permission denied"* or nothing happens | Use `Host Sizing Calculator.app`, or open Terminal and run `bash ` then drag `Run_on_mac.command` into the window and press Return. |
+| Mac: *"app is damaged"* or won't open after an update | In Terminal run: `codesign --force --deep --sign - ` then drag `Host Sizing Calculator.app` into the window and press Return. |
+| Windows: Python install declined or `winget` missing | The launcher opens python.org. Install Python 3.12+, tick **Add python.exe to PATH**, then double-click the launcher again. |
+| *"Could not create the Python environment"* | The folder is read-only. Move the tool folder to Documents and try again. |
+| The tool behaves oddly after an update | Delete the hidden `.venv` folder in the tool folder; the next launch rebuilds it. |
 
 ---
 
@@ -75,6 +86,7 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * `ahead_logo.png` / `ahead_logo_white.png`: AHEAD logos (light / dark backgrounds) embedded in the app and report.
 * `Run_on_windows.bat`: Windows installer + launcher.
 * `Run_on_mac.command`: macOS installer + launcher.
+* `Host Sizing Calculator.app`: Mac double-click shortcut that runs `Run_on_mac.command`.
 
 ## 🛠 Configuration Options (Recommendation page → Sizing parameters)
 
@@ -86,6 +98,11 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.4**
+* Easier first run. The Windows launcher finds a real Python (ignoring the Microsoft Store placeholder), checks standard install folders, and offers to install Python 3.12 with winget; otherwise it opens python.org. The Mac launcher prefers a newer python.org/Homebrew Python, falls back to Apple's, and installs the Command Line Tools when needed.
+* Both launchers rebuild a damaged `.venv`, explain download failures (internet, VPN, proxy), and skip Streamlit's first-run email prompt. Streamlit usage statistics are turned off.
+* `Host Sizing Calculator.app` now runs `Run_on_mac.command`, so it no longer depends on the Mac's built-in Python libraries and works even if the launcher lost its execute permission.
 
 **3.3**
 * **Saved projects.** Use **Save project** at the top of any page to keep a sizing and reopen it later from **Home → Your project library**. A project stores your settings (hypervisor, hardware, constraints, override, growth, cluster scope, customer name and logo) plus only the columns the sizing uses; everything else in the export (IP addresses, annotations, networks, etc.) is discarded.
