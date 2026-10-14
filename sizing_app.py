@@ -12,6 +12,7 @@ Layout of this file:
   7. Streamlit UI
 """
 import base64
+import copy
 import gzip
 import hashlib
 import io
@@ -30,7 +31,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.5"
+APP_VERSION = "3.7"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -199,7 +200,7 @@ def cluster_list(source, sheets):
 # 3b. PROJECT LIBRARY (saved projects keep ONLY the columns the sizing needs)
 # =============================================================================
 PROJECT_FORMAT = "hostsizer-project"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2   # v2: sizing settings stored per cluster scope
 PROJECT_EXT = ".hsproj"
 PROJECTS_DIR = os.path.expanduser(os.environ.get("HOSTSIZER_PROJECTS", os.path.join("~", "HostSizer", "Projects")))
 
@@ -1456,6 +1457,17 @@ def report_summary(entry):
     return source, f"{hosts:,} hosts · {vms:,} VMs · {len(cluster_list(source, sheets))} clusters"
 
 
+def safe_filename_part(text):
+    """Strip characters Windows and macOS don't allow in file names."""
+    cleaned = "".join("_" if ch in '\\/:*?"<>|' or ord(ch) < 32 else ch for ch in str(text))
+    return " ".join(cleaned.split()).strip(" .") or "Untitled"
+
+
+def report_file_name(customer, cluster):
+    """Default download name: <customer>-<cluster>-AHEAD Sizing.html"""
+    return f"{safe_filename_part(customer)}-{safe_filename_part(cluster)}-AHEAD Sizing.html"
+
+
 def build_context():
     """Parse the active report and run the sizing with the current parameters."""
     ss = st.session_state
@@ -1472,6 +1484,9 @@ def build_context():
                          f"(VMs + ESX Hosts tabs).", "exc": None, "name": name}
     clusters = cluster_list(source, sheets)
     ss.scope = [c for c in ss.scope if c in clusters]
+    if len(clusters) == 1:
+        ss.scope = [clusters[0]]          # one cluster: select it rather than "All Clusters"
+    sync_scope_settings(name, entry)
     scope = ss.scope or None
     scope_label = ALL_CLUSTERS if scope is None else " + ".join(scope)
     p = params_from_state()
@@ -1487,10 +1502,9 @@ def build_context():
         return {"error": f"A required column or tab is missing from '{name}': {exc}", "exc": exc, "name": name}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Error processing '{name}': {exc}", "exc": exc, "name": name}
-    base = os.path.splitext(entry.get("file_name", name))[0]
-    safe_scope = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in scope_label.replace(" + ", "-"))
+    report_name = report_file_name(p["customer"], scope_label)
     return {"key": name, "name": entry.get("project_name") or name, "source": source, "sheets": sheets, "clusters": clusters, "inv": inv, "r": r,
-            "html": html, "file_name": f"{base}_{safe_scope}_Sizing.html", "error": None}
+            "html": html, "file_name": report_name, "error": None}
 
 
 # ---------- shared UI pieces ----------
@@ -1586,6 +1600,12 @@ def scope_bar(ctx):
         st.multiselect("Cluster scope", ctx["clusters"], key="scope", help=help_txt, placeholder="All clusters")
     if len(st.session_state.scope) > 1:
         st.caption(f":material/merge: Consolidation scope: combining {len(st.session_state.scope)} clusters.")
+    store = st.session_state.reports[ctx["key"]].get("scope_settings", {})
+    current = scope_key(st.session_state.scope)
+    if len(ctx["clusters"]) > 1:
+        tags = " ".join(f":{'blue' if k == current else 'gray'}-badge[{k}]" for k in sorted(store))
+        st.caption(":material/tune: Sizing settings are kept separately for each cluster selection. "
+                   f"Configured: {tags}")
 
 
 def require_report(title):
@@ -1610,12 +1630,62 @@ def require_report(title):
 
 
 # ---------- saved projects ----------
-SETTING_KEYS = PARAM_KEYS + ["growth_pct", "scope"]
+# Sizing settings are kept per cluster scope; the customer name is per report/project.
+SIZING_KEYS = [k for k in PARAM_KEYS if k != "customer"] + ["growth_pct"]
 
 
-def settings_snapshot():
+def scope_key(scope):
+    return " + ".join(sorted(scope)) if scope else ALL_CLUSTERS
+
+
+def sizing_snapshot():
     ss = st.session_state
-    return {k: ss[k] for k in SETTING_KEYS}
+    return {k: ss[k] for k in SIZING_KEYS}
+
+
+def load_sizing(values):
+    for k, v in (values or {}).items():
+        if k in SIZING_KEYS:
+            st.session_state[k] = v
+
+
+def sync_scope_settings(entry_name, entry):
+    """Keep the sizing widgets in step with the selected cluster scope.
+    Entering a scope loads its saved settings; a scope seen for the first time starts from
+    the settings currently on screen (copy last used). Every run stores the current values."""
+    ss = st.session_state
+    key = scope_key(ss.scope)
+    store = entry.setdefault("scope_settings", {})
+    if ss.get("_scope_for") != (entry_name, key):
+        if key in store:
+            load_sizing(store[key])
+        ss._scope_for = (entry_name, key)
+    store[key] = sizing_snapshot()
+    entry["last_scope"] = list(ss.scope)
+    entry["customer"] = ss.customer
+
+
+def project_settings(entry):
+    """Everything a project stores about the user's choices (deep copy)."""
+    return copy.deepcopy({"customer": st.session_state.customer,
+                          "scope_settings": entry.get("scope_settings", {}),
+                          "last_scope": entry.get("last_scope", [])})
+
+
+def settings_fingerprint(settings):
+    """Part of the settings that counts as a change (which scope is on screen does not)."""
+    return {"customer": settings.get("customer"), "scope_settings": settings.get("scope_settings")}
+
+
+def _activate_report(name):
+    """Make a session report active and restore its last cluster scope and customer."""
+    ss = st.session_state
+    ss.active = name
+    entry = ss.reports.get(name, {})
+    ss.scope = list(entry.get("last_scope", []))
+    if entry.get("customer"):
+        ss.customer = entry["customer"]
+    ss._scope_for = None
 
 
 def flash(kind, msg):
@@ -1673,14 +1743,15 @@ def _save_project():
         payload = {
             "format": PROJECT_FORMAT, "version": PROJECT_VERSION, "app_version": APP_VERSION,
             "name": name, "created": created, "saved": now,
-            "settings": settings_snapshot(),
+            "settings": project_settings(entry),
             "customer_logo": ({"type": logo["type"], "name": logo["name"],
                                "b64": base64.b64encode(logo["bytes"]).decode()} if logo else None),
             "source": {"type": source, "file_name": entry.get("file_name", key),
                        "sha256": entry.get("sha256"), "sheets": frames_to_json(reduced)},
             "summary": {"customer": ss.customer, "hypervisor": full_r["hypervisor"],
                         "hosts": full_r["cur_host_count"], "vms": full_r["tot_vms"],
-                        "hosts_now": full_r["hosts_now"], "scope": " + ".join(ss.scope) or ALL_CLUSTERS},
+                        "hosts_now": full_r["hosts_now"], "scope": " + ".join(ss.scope) or ALL_CLUSTERS,
+                        "configured": sorted(entry.get("scope_settings", {}))},
         }
         write_project(path, payload)
         if old and old != path and os.path.exists(old):
@@ -1688,7 +1759,7 @@ def _save_project():
     except Exception as exc:  # noqa: BLE001
         flash("error", f"Could not save the project: {exc}")
         return
-    entry.update(project_path=path, project_name=name, saved_settings=settings_snapshot(),
+    entry.update(project_path=path, project_name=name, saved_settings=project_settings(entry),
                  saved_logo=bool(logo), saved_at=now)
     flash("success", f"Saved '{name}' to {path}")
 
@@ -1703,17 +1774,31 @@ def _open_project(path):
         return
     name = payload["name"]
     key = f"{name} (project)"
-    for k, v in payload.get("settings", {}).items():
-        if k in DEFAULTS or k == "growth_pct":
-            ss[k] = v
+    settings = payload.get("settings", {})
+    if "scope_settings" in settings:                     # v2: per-scope settings
+        scope_settings = settings["scope_settings"]
+        last_scope = settings.get("last_scope", [])
+    else:                                                # v1: one flat set of settings
+        last_scope = settings.get("scope", [])
+        scope_settings = {scope_key(last_scope): {k: v for k, v in settings.items() if k in SIZING_KEYS}}
+    # Fill any setting a project doesn't carry (older versions) with the tool default.
+    scope_settings = {k: {**{sk: DEFAULTS[sk] for sk in SIZING_KEYS}, **{sk: sv for sk, sv in v.items() if sk in SIZING_KEYS}}
+                      for k, v in scope_settings.items()}
+    customer = settings.get("customer") or payload.get("summary", {}).get("customer") or ss.customer
     logo = payload.get("customer_logo")
     ss.cust_logo = ({"type": logo["type"], "name": logo.get("name", "logo"),
                      "bytes": base64.b64decode(logo["b64"])} if logo else None)
-    ss.reports[key] = {"sheets": sheets, "source": payload["source"]["type"],
-                       "file_name": payload["source"]["file_name"], "sha256": payload["source"].get("sha256"),
-                       "uploaded": datetime.now(), "project_path": path, "project_name": name,
-                       "saved_settings": settings_snapshot(), "saved_logo": bool(logo), "saved_at": payload.get("saved")}
-    ss.active = key
+    entry = {"sheets": sheets, "source": payload["source"]["type"],
+             "file_name": payload["source"]["file_name"], "sha256": payload["source"].get("sha256"),
+             "uploaded": datetime.now(), "project_path": path, "project_name": name,
+             "scope_settings": copy.deepcopy(scope_settings), "last_scope": list(last_scope), "customer": customer,
+             "saved_logo": bool(logo), "saved_at": payload.get("saved")}
+    entry["saved_settings"] = copy.deepcopy({"customer": customer, "scope_settings": scope_settings,
+                                             "last_scope": list(last_scope)})
+    ss.reports[key] = entry
+    _activate_report(key)
+    load_sizing(scope_settings.get(scope_key(last_scope)))
+    ss._scope_for = (key, scope_key(last_scope))
     ss._save_for = None
     ss._goto = "env"
 
@@ -1733,7 +1818,7 @@ def _delete_project(path):
 def save_status(entry):
     if not entry.get("project_path"):
         return ":gray-badge[:material/cloud_off: Not saved]"
-    dirty = (entry.get("saved_settings") != settings_snapshot()
+    dirty = (settings_fingerprint(entry.get("saved_settings") or {}) != settings_fingerprint(project_settings(entry))
              or entry.get("saved_logo") != bool(st.session_state.get("cust_logo")))
     return (":orange-badge[:material/edit: Unsaved changes]" if dirty
             else ":green-badge[:material/check_circle: Saved]")
@@ -1786,7 +1871,9 @@ def render_saved_projects():
                 saved = (meta.get("saved") or "").replace("T", " ")[:16]
                 st.caption(f"{sm.get('customer', '')} · {meta['file_name']}  \n"
                            f"{sm.get('hosts', 0):,} hosts · {sm.get('vms', 0):,} VMs · "
-                           f"{sm.get('hosts_now', 0)} recommended · {sm.get('scope', '')}  \nSaved {saved}")
+                           f"{sm.get('hosts_now', 0)} recommended · {sm.get('scope', '')}  \n"
+                           + (f"{len(sm['configured'])} cluster configuration{'s' if len(sm['configured']) != 1 else ''} · "
+                              if sm.get("configured") else "") + f"Saved {saved}")
                 b1, b2 = st.columns(2)
                 b1.button("Open", key=f"popen_{path}", icon=":material/folder_open:", type="primary",
                           width="stretch", on_click=_open_project, args=(path,))
@@ -1820,7 +1907,7 @@ def render_sidebar():
     if reports:
         sb.html("<div class='hs-label'>Active report</div>")
         sb.selectbox("Active report", list(reports), key="active", label_visibility="collapsed",
-                     on_change=lambda: st.session_state.update(scope=[]))
+                     on_change=lambda: _activate_report(st.session_state.active))
         if has_report:
             sb.caption(f"{CTX['source']} · {CTX['r']['scope_label']}")
     sb.html("<div class='hs-label'>About</div>")
@@ -1833,17 +1920,17 @@ def _ingest_uploads():
     files = ss.get("uploader") or []
     for f in files:
         data = f.getvalue()
+        prev = ss.reports.get(f.name, {})
         ss.reports[f.name] = {"bytes": data, "file_name": f.name, "uploaded": datetime.now(),
-                              "sha256": hashlib.sha256(data).hexdigest()}
+                              "sha256": hashlib.sha256(data).hexdigest(),
+                              "scope_settings": prev.get("scope_settings", {}), "last_scope": prev.get("last_scope", [])}
     if files:
-        ss.active = files[-1].name
-        ss.scope = []
+        _activate_report(files[-1].name)
         ss._goto = "env"
 
 
 def _open_report(name):
-    st.session_state.active = name
-    st.session_state.scope = []
+    _activate_report(name)
     st.session_state._goto = "env"
 
 
@@ -1851,8 +1938,11 @@ def _remove_report(name):
     ss = st.session_state
     ss.reports.pop(name, None)
     if ss.active == name:
-        ss.active = next(iter(ss.reports), None)
-        ss.scope = []
+        nxt = next(iter(ss.reports), None)
+        if nxt:
+            _activate_report(nxt)
+        else:
+            ss.active, ss.scope = None, []
 
 
 def page_home():
@@ -1929,7 +2019,8 @@ def _apply_hv_ratio():
 def render_parameters(ctx):
     with st.container(border=True):
         st.markdown("#### Sizing parameters")
-        st.caption("Changes apply instantly to every page and to the downloadable report.")
+        st.caption(f"These settings apply to **{scope_key(st.session_state.scope)}** only. Each cluster selection "
+                   "keeps its own settings; a new selection starts from the last one you used.")
         t0, t1, t2, t3, t4 = st.tabs([":material/layers: Hypervisor", ":material/memory: Target hardware",
                                       ":material/rule: Constraints", ":material/lock: Host count override",
                                       ":material/trending_up: Scope & growth"])

@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.5)
+# 📊 Virtualization Sizing Calculator (v3.7)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.5
+**Version:** 3.7
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -99,6 +99,14 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.7**
+* Downloaded reports are named `<customer>-<cluster>-AHEAD Sizing.html` (e.g. `Acme Corp-Prod-AHEAD Sizing.html`; consolidations read `Acme Corp-C1 + C2-AHEAD Sizing.html`, the full environment `Acme Corp-All Clusters-AHEAD Sizing.html`).
+
+**3.6**
+* **Settings per cluster.** Every cluster selection (each single cluster, any consolidation combination, and All Clusters) keeps its own sizing settings: hypervisor, hardware, constraints, override, growth and powered-off handling. A selection you haven't configured yet starts from the one you were just on. Saved projects store all of them, so one project covers every cluster in the export; click through the clusters to review each configuration. The customer name is shared across the project.
+* If the export has a single cluster, it is selected automatically instead of "All Clusters".
+* The downloadable report covers the cluster selection on screen. Projects saved by older versions open normally.
 
 **3.5**
 * Host Sizer logo (draft, pending Brand Marketing review) in the sidebar and as the browser-tab icon. The HTML report is unchanged.
