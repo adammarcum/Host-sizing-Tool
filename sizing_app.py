@@ -19,6 +19,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime
 from html import escape
@@ -31,7 +32,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -1277,6 +1278,13 @@ def generate_html_report(r, customer_logo_uri=None):
 PRODUCT_NAME = "Host Sizer"
 MIN_STREAMLIT = (1, 50)
 
+# Update check: reads only the version line of sizing_app.py on GitHub. Nothing about the
+# user or their data is sent. Set HOSTSIZER_NO_UPDATE_CHECK=1 to turn it off.
+REPO_URL = "https://github.com/adammarcum/Host-sizing-Tool"
+UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/sizing_app.py"
+UPDATE_ZIP_URL = REPO_URL + "/archive/refs/heads/main.zip"
+UPDATE_NOTES_URL = REPO_URL + "/blob/main/ReadMe.txt"
+
 THEME_MARKER = "# Managed by Host Sizer (sizing_app.py)."
 THEME_TOML = THEME_MARKER + """ Delete this line to stop automatic updates.
 [theme]
@@ -1309,6 +1317,13 @@ gatherUsageStats = false
 
 APP_CSS = """<style>
 .hs-brand { padding: 2px 2px 18px; margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,.12); }
+.hs-update { background: rgba(0,179,136,.16); border: 1px solid rgba(110,206,178,.45); border-radius: 12px;
+             padding: 12px 14px; margin: 4px 0 10px; color: #FFFFFF; font-size: 13px; line-height: 1.45; }
+.hs-update .t { font-weight: 600; color: #6ECEB2; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+.hs-update .v { margin: 4px 0 10px; color: rgba(255,255,255,.88); }
+.hs-update a { display: inline-block; text-decoration: none; font-weight: 500; font-size: 12.5px; border-radius: 9999px; }
+.hs-update a.dl { background: #00B388; color: #FFFFFF; padding: 6px 14px; margin-right: 8px; }
+.hs-update a.nt { color: #67C3E9; }
 .hs-brand img.lockup { width: 100%; max-width: 230px; height: auto; display: block; }
 .hs-brand .name { font-size: 30px; font-weight: 700; color: #FFFFFF; line-height: 1.05; letter-spacing: -.01em; }
 .hs-brand .pb { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.8); }
@@ -1883,6 +1898,46 @@ def render_saved_projects():
                               args=(path,))
 
 
+# ---------- update check ----------
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4])
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_latest_version():
+    """Newest APP_VERSION on GitHub. Raises on failure, so failures aren't cached."""
+    import urllib.request
+    req = urllib.request.Request(UPDATE_SOURCE_URL, headers={"Range": "bytes=0-8191",
+                                                             "User-Agent": f"HostSizer/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        head = resp.read(8192).decode("utf-8", "ignore")
+    return re.search(r'^APP_VERSION = "([^"]+)"', head, re.M).group(1)
+
+
+def latest_version():
+    """Newest version on GitHub, or None when disabled, offline or blocked (3 s timeout)."""
+    if os.environ.get("HOSTSIZER_NO_UPDATE_CHECK"):
+        return None
+    try:
+        return _fetch_latest_version()
+    except Exception:  # noqa: BLE001 - offline, proxy, GitHub down: just skip the notice
+        return None
+
+
+def render_update_notice(container):
+    latest = latest_version()
+    if not latest or version_tuple(latest) <= version_tuple(APP_VERSION):
+        return
+    container.html(
+        f"<div class='hs-update'><div class='t'>Update available</div>"
+        f"<div class='v'>Version {escape(latest)} is out. You have {escape(APP_VERSION)}.</div>"
+        f"<a class='dl' href='{UPDATE_ZIP_URL}' target='_blank' rel='noopener'>Download update</a>"
+        f"<a class='nt' href='{UPDATE_NOTES_URL}' target='_blank' rel='noopener'>What's new</a></div>")
+    if not st.session_state.get("_update_toast"):
+        st.session_state._update_toast = True
+        st.toast(f"Host Sizer {latest} is available. See the sidebar to download it.", icon=":material/system_update:")
+
+
 # ---------- sidebar ----------
 def render_sidebar():
     sb = st.sidebar
@@ -1895,6 +1950,7 @@ def render_sidebar():
         pb = f"Powered by <img src='{logo}' alt='AHEAD'>" if logo else "Powered by AHEAD"
         sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div></div>")
 
+    render_update_notice(sb)
     has_report = CTX is not None and not CTX.get("error")
     sb.html("<div class='hs-label'>Workspace</div>")
     sb.page_link(PAGES["home"], label="Home", icon=":material/home:")

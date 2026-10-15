@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.7)
+# 📊 Virtualization Sizing Calculator (v3.8)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.7
+**Version:** 3.8
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -99,6 +99,9 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.8**
+* **Update notice.** When a newer version is published on GitHub, the sidebar shows an *Update available* card with a **Download update** button and a link to what's new (plus a one-time pop-up). The check reads only the version number from GitHub, at most every 6 hours, and is skipped silently when offline. Set `HOSTSIZER_NO_UPDATE_CHECK=1` to turn it off.
 
 **3.7**
 * Downloaded reports are named `<customer>-<cluster>-AHEAD Sizing.html` (e.g. `Acme Corp-Prod-AHEAD Sizing.html`; consolidations read `Acme Corp-C1 + C2-AHEAD Sizing.html`, the full environment `Acme Corp-All Clusters-AHEAD Sizing.html`).
