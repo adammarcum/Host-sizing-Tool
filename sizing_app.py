@@ -32,7 +32,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.8"
+APP_VERSION = "3.9"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -1284,6 +1284,8 @@ REPO_URL = "https://github.com/adammarcum/Host-sizing-Tool"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/sizing_app.py"
 UPDATE_ZIP_URL = REPO_URL + "/archive/refs/heads/main.zip"
 UPDATE_NOTES_URL = REPO_URL + "/blob/main/ReadMe.txt"
+MAC_INSTALL_CMD = ("curl -fsSL https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/install_mac.sh"
+                   " | bash")
 
 THEME_MARKER = "# Managed by Host Sizer (sizing_app.py)."
 THEME_TOML = THEME_MARKER + """ Delete this line to stop automatic updates.
@@ -1324,6 +1326,7 @@ APP_CSS = """<style>
 .hs-update a { display: inline-block; text-decoration: none; font-weight: 500; font-size: 12.5px; border-radius: 9999px; }
 .hs-update a.dl { background: #00B388; color: #FFFFFF; padding: 6px 14px; margin-right: 8px; }
 .hs-update a.nt { color: #67C3E9; }
+.hs-update .mac { margin-top: 8px; font-size: 11.5px; color: rgba(255,255,255,.7); }
 .hs-brand img.lockup { width: 100%; max-width: 230px; height: auto; display: block; }
 .hs-brand .name { font-size: 30px; font-weight: 700; color: #FFFFFF; line-height: 1.05; letter-spacing: -.01em; }
 .hs-brand .pb { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.8); }
@@ -1932,7 +1935,10 @@ def render_update_notice(container):
         f"<div class='hs-update'><div class='t'>Update available</div>"
         f"<div class='v'>Version {escape(latest)} is out. You have {escape(APP_VERSION)}.</div>"
         f"<a class='dl' href='{UPDATE_ZIP_URL}' target='_blank' rel='noopener'>Download update</a>"
-        f"<a class='nt' href='{UPDATE_NOTES_URL}' target='_blank' rel='noopener'>What's new</a></div>")
+        f"<a class='nt' href='{UPDATE_NOTES_URL}' target='_blank' rel='noopener'>What's new</a>"
+        + ("<div class='mac'>On a Mac you can also update by running the install command in Terminal "
+           "(see the ReadMe).</div>" if sys.platform == "darwin" else "")
+        + "</div>")
     if not st.session_state.get("_update_toast"):
         st.session_state._update_toast = True
         st.toast(f"Host Sizer {latest} is available. See the sidebar to download it.", icon=":material/system_update:")

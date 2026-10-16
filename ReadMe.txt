@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.8)
+# 📊 Virtualization Sizing Calculator (v3.9)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.8
+**Version:** 3.9
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -11,14 +11,21 @@ A unified infrastructure sizing tool designed for Solutions Architects. It inges
 
 **No coding knowledge required. Nothing to install by hand.**
 
-1.  **Download and unzip** the tool into a normal folder (e.g. Documents). Keep all the files together.
+1.  **Windows:** download the ZIP and unzip it into a normal folder (e.g. Documents), keeping all the files together. **Mac:** skip this step if you use the one-command install below.
 
-2.  **Double-click the launcher for your computer:**
+2.  **Start it:**
 
-    | Computer | Double-click | First time only |
-    |---|---|---|
-    | **Windows** | `Run_on_windows.bat` | If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**. If Python isn't installed, the launcher offers to install it for you (answer **Y**). |
-    | **Mac** | `Host Sizing Calculator.app` (or `Run_on_mac.command`) | If macOS says it's from an *unidentified developer*, **right-click → Open → Open**. If Python isn't installed, click **Install** on the macOS popup. |
+    * **Mac (easiest): one command.** Open **Terminal** (Cmd+Space, type *Terminal*), paste this line and press Return:
+
+      ```
+      curl -fsSL https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/install_mac.sh | bash
+      ```
+
+      It installs Host Sizer in `~/HostSizer/app` and starts it, with no macOS security prompts. Run the same line again any time to update. Afterwards you can also double-click `Host Sizing Calculator.app` in `~/HostSizer/app`.
+
+    * **Windows:** double-click `Run_on_windows.bat` in the unzipped folder. If Windows shows *"Windows protected your PC"*, click **More info → Run anyway**. If Python isn't installed, the launcher offers to install it for you (answer **Y**).
+
+    * **Mac from the ZIP instead:** macOS blocks apps downloaded from the internet. On macOS 15 (Sequoia) and later, open the app once, then go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. Even then macOS may run the app from a temporary copy and report that `Run_on_mac.command` was not found; use the one-command install above instead.
 
 3.  **Wait for your browser to open.** The first run downloads the libraries (about 100 MB, a few minutes). Later runs start in seconds and work offline. Keep the black/Terminal window open while you use the tool; close it to stop.
 
@@ -32,6 +39,8 @@ A unified infrastructure sizing tool designed for Solutions Architects. It inges
 | What you see | What to do |
 |---|---|
 | *"The libraries could not be downloaded"* | You need internet for the first run. Connect (and join VPN if required) and try again. A proxy may be blocking `pypi.org` / `files.pythonhosted.org` - ask your eTech team to allow them. |
+| Mac: *"Apple could not verify ... is free of malware"* / *"Not Opened"* | Use the one-command install in step 2 (no prompts). Or: **System Settings → Privacy & Security → Open Anyway**. |
+| Mac: *"Run_on_mac.command was not found next to this app"* | macOS is running the downloaded app from a temporary copy. The app has already copied the install command to your clipboard: open Terminal, press Cmd+V, then Return. |
 | Mac: *"permission denied"* or nothing happens | Use `Host Sizing Calculator.app`, or open Terminal and run `bash ` then drag `Run_on_mac.command` into the window and press Return. |
 | Mac: *"app is damaged"* or won't open after an update | In Terminal run: `codesign --force --deep --sign - ` then drag `Host Sizing Calculator.app` into the window and press Return. |
 | Windows: Python install declined or `winget` missing | The launcher opens python.org. Install Python 3.12+, tick **Add python.exe to PATH**, then double-click the launcher again. |
@@ -88,6 +97,7 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * `Run_on_windows.bat`: Windows installer + launcher.
 * `Run_on_mac.command`: macOS installer + launcher.
 * `Host Sizing Calculator.app`: Mac double-click shortcut that runs `Run_on_mac.command`.
+* `install_mac.sh`: Mac one-command installer / updater (installs to `~/HostSizer/app`).
 
 ## 🛠 Configuration Options (Recommendation page → Sizing parameters)
 
@@ -99,6 +109,11 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.9**
+* **Easier Mac install.** New one-command installer and updater: paste `curl -fsSL https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/install_mac.sh | bash` into Terminal. It installs to `~/HostSizer/app` and starts the tool without macOS security prompts, and re-running it updates in place (your environment and projects are kept).
+* `Host Sizing Calculator.app` now explains macOS's "temporary copy" problem (App Translocation) instead of only saying `Run_on_mac.command` was not found, and copies the install command to your clipboard.
+* Install instructions updated for macOS 15 (Sequoia), where right-click → Open no longer bypasses the security prompt.
 
 **3.8**
 * **Update notice.** When a newer version is published on GitHub, the sidebar shows an *Update available* card with a **Download update** button and a link to what's new (plus a one-time pop-up). The check reads only the version number from GitHub, at most every 6 hours, and is skipped silently when offline. Set `HOSTSIZER_NO_UPDATE_CHECK=1` to turn it off.
