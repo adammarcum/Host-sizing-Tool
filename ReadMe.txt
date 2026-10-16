@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.9)
+# 📊 Virtualization Sizing Calculator (v3.10)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.9
+**Version:** 3.10
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -30,8 +30,8 @@ A unified infrastructure sizing tool designed for Solutions Architects. It inges
 3.  **Wait for your browser to open.** The first run downloads the libraries (about 100 MB, a few minutes). Later runs start in seconds and work offline. Keep the black/Terminal window open while you use the tool; close it to stop.
 
 4.  **Use the tool:**
-    * On **Home**, upload one or more **RVTools.xlsx** or **Live Optics.xlsx** files. Each appears as a tile; click **Open** to work on it, or switch the active report in the sidebar.
-    * Review **Current Environment**, tune the sizing on **Recommendation**, set the customer name/logo on **Report**, then click **Download report**.
+    * On **Home**, upload one or more **RVTools.xlsx** or **Live Optics.xlsx** files. Each upload joins the current project, so add all your exports first, then click **Configure clusters**; choose **Start a new project** for a separate one. Projects appear as tiles; click **Open** to work on one, or switch in the sidebar.
+    * Review **Current Environment**, tune the sizing on **Recommendation**, set the customer name/logo on **Report**, then click **Download consolidated report** (or pick one cluster under **Single reports**).
     * Click **Save project** to keep the sizing. Saved projects appear on **Home** under *Your project library* and reopen with all settings.
 
 ### 🧰 If something goes wrong
@@ -88,6 +88,8 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 ### 5. Professional Reporting
 * Downloadable HTML report with the AHEAD logo embedded (works offline and when emailed). Preview it on the **Report** page, where a customer logo can also be uploaded.
 
+* **PowerPoint instead of HTML:** the *Host Sizer report to PowerPoint* Glean skill converts the single or consolidated HTML report into AHEAD-branded slides. Download it from the [shared folder](https://thinkaheadit-my.sharepoint.com/:f:/g/personal/adam_marcum_ahead_com/IgDNWcoha-wgSrplF3-tJ3g4AYkkNnGxvsdONp3Q7LS2zFE?e=b1Gr6H) and add it to Glean.
+
 ## 📂 Repository Structure
 
 * `sizing_app.py`: The application.
@@ -109,6 +111,15 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
 
 ## 📝 Changelog
+
+**3.10**
+* **Consolidated report.** *Download consolidated report* (the default) creates one HTML file, `<customer>-Consolidated-AHEAD Sizing.html`, with a **Summary** tab and a tab for every sized cluster. The Summary shows totals for current vs. Day 1 vs. future, a cluster comparison table (click a name to open its tab), a licensing and storage roll-up, and a list of risks and flags by cluster. Print / Save PDF prints every tab.
+* Consolidations (e.g. `C1 + C2`) and an edited *All Clusters* selection appear as **scenario** tabs and aren't added to the totals, so nothing is counted twice.
+* **Several exports in one project.** On **Home**, add as many RVTools and/or Live Optics files as you need: each upload joins the current project (choose **Start a new project** to begin a separate one), and you stay on Home until you click **Configure clusters**. Every cluster from every file then appears under **Cluster scope**, ready to click through and size. With two or more sources, clusters are named `source · cluster` (the source name defaults to the vCenter, and can be renamed on Home), so clusters from different vCenters stay separate and can be selected together to size a cross-site consolidation. The consolidated report covers every source.
+* Each source can be included or excluded, or removed. Sources that share VM or host names are flagged as a *possible overlap* so the same environment isn't counted twice. Performance sizing is shown when every cluster in a selection comes from Live Optics. Saved projects keep all sources (only the columns the sizing needs); older projects open unchanged.
+* **Out-of-scope clusters.** Select a single cluster and turn off **Active** (under Cluster scope) to take it out of scope: it isn't sized, can't be configured, and is left out of All Clusters, consolidations and every report. Out-of-scope clusters are marked in the cluster tags and saved with the project.
+* The consolidated report's cluster tabs wrap onto several rows, so every cluster is visible without scrolling sideways.
+* Each cluster or scenario can still be downloaded on its own from **Single reports**. The Report page lists what the consolidated report contains, notes any clusters not yet sized, and previews either the consolidated or the single report.
 
 **3.9**
 * **Easier Mac install.** New one-command installer and updater: paste `curl -fsSL https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/install_mac.sh | bash` into Terminal. It installs to `~/HostSizer/app` and starts the tool without macOS security prompts, and re-running it updates in place (your environment and projects are kept).

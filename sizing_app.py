@@ -21,6 +21,7 @@ import math
 import os
 import re
 import sys
+import uuid
 from datetime import datetime
 from html import escape
 
@@ -32,7 +33,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.9"
+APP_VERSION = "3.10"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -201,7 +202,7 @@ def cluster_list(source, sheets):
 # 3b. PROJECT LIBRARY (saved projects keep ONLY the columns the sizing needs)
 # =============================================================================
 PROJECT_FORMAT = "hostsizer-project"
-PROJECT_VERSION = 2   # v2: sizing settings stored per cluster scope
+PROJECT_VERSION = 3   # v2: settings per cluster scope; v3: several sources per project
 PROJECT_EXT = ".hsproj"
 PROJECTS_DIR = os.path.expanduser(os.environ.get("HOSTSIZER_PROJECTS", os.path.join("~", "HostSizer", "Projects")))
 
@@ -217,7 +218,7 @@ REQUIRED_COLUMNS = {
     "RVTools": {
         "vInfo": ["VM", "Powerstate", "Template", "SRM Placeholder", "Cluster", "CPUs", "Memory", "Memory GB"]
                  + _unit_cols("Provisioned", "In Use"),
-        "vHost": ["Cluster", "# CPU", "Cores per CPU", "# Memory", "CPU Model", "CPU model",
+        "vHost": ["Host", "Cluster", "# CPU", "Cores per CPU", "# Memory", "CPU Model", "CPU model",
                   "Speed", "CPU Speed", "Speed MHz", "ESX Version", "Product"],
         "vDatastore": ["Name", "Cluster name", "Cluster"] + _unit_cols("Capacity", "In Use"),
         "vPartition": ["VM"] + _unit_cols("Consumed"),
@@ -296,8 +297,11 @@ def read_project(path):
 def project_meta(path, mtime):
     """Light metadata for the Home tiles (cached until the file changes)."""
     p = read_project(path)
+    srcs = p.get("sources") or [p["source"]]
+    types = sorted({x["type"] for x in srcs})
+    files = srcs[0]["file_name"] + (f" + {len(srcs) - 1} more" if len(srcs) > 1 else "")
     return {k: p.get(k) for k in ("name", "saved", "created", "app_version", "summary")} | {
-        "source_type": p["source"]["type"], "file_name": p["source"]["file_name"]}
+        "source_type": " + ".join(types), "file_name": files, "n_sources": len(srcs)}
 
 
 def list_projects(folder=None):
@@ -1273,6 +1277,238 @@ def generate_html_report(r, customer_logo_uri=None):
 
 
 # =============================================================================
+# 6b. CONSOLIDATED REPORT (Summary tab + one tab per sized cluster)
+# =============================================================================
+CONSOLIDATED_CSS = """
+.tabbar { position: sticky; top: 64px; z-index: 19; background: var(--white); border-bottom: 1px solid var(--surface); box-shadow: 0 4px 14px rgba(16,32,51,.06); }
+.tabbar .wrap { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 10px; padding-bottom: 10px; }
+.tab { font: 500 14px var(--font); color: var(--navy); background: transparent; border: 1px solid transparent; border-radius: 9999px;
+       padding: 8px 16px; cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 8px; }
+.tab:hover { background: var(--surface); }
+.tab[aria-selected="true"] { background: var(--navy); color: var(--white); }
+.tab .kind { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .7; }
+.tdot { width: 7px; height: 7px; border-radius: 50%; background: #FF8A80; display: inline-block; }
+.tabpanel { scroll-margin-top: 130px; }
+.table-card.scroll { overflow-x: auto; }
+.compare tr.total td { font-weight: 600; color: var(--navy); background: rgba(18,58,97,.05); }
+.compare a, .card .label a { color: var(--bright-blue); font-weight: 600; text-decoration: none; }
+.tag.mini { font-size: 10.5px; padding: 2px 8px; margin: 0 0 0 6px; vertical-align: middle; }
+.foot { font-size: 12.5px; color: var(--gray); margin-top: 12px; }
+.flags { list-style: none; padding: 0; margin: 6px 0 0; }
+.flags li { font-size: 14px; line-height: 1.55; color: var(--gray); padding: 8px 0; border-bottom: 1px solid var(--surface); }
+.flags li:last-child { border-bottom: 0; }
+.ftype { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+         color: var(--white); background: var(--navy); border-radius: 9999px; padding: 2px 9px; margin-right: 8px; }
+@media print {
+  .tabbar { display: none; }
+  .tabpanel[hidden] { display: block !important; }
+  .tabpanel + .tabpanel { page-break-before: always; }
+}
+"""
+
+CONSOLIDATED_JS = """<script>
+function showTab(id) {
+  document.querySelectorAll('.tabpanel').forEach(function (p) { p.hidden = p.id !== id; });
+  document.querySelectorAll('.tab').forEach(function (t) { t.setAttribute('aria-selected', t.dataset.tab === id); });
+  if (history.replaceState) history.replaceState(null, '', '#' + id);
+  window.scrollTo({ top: 0 });
+}
+document.querySelectorAll('.tab').forEach(function (t) { t.addEventListener('click', function () { showTab(t.dataset.tab); }); });
+var start = (location.hash || '#summary').slice(1);
+showTab(document.querySelector('.tabpanel[id="' + start + '"]') ? start : 'summary');
+</script>"""
+
+RATIO_CELL_NAMES = {(4, 1): "current", (4, 2): "Day 1", (4, 3): "future",
+                    (5, 1): "current at failover", (5, 2): "Day 1 at failover", (5, 3): "future at failover"}
+
+
+def report_flags(r):
+    """Issues worth surfacing on the consolidated Summary tab: [(type, text)]."""
+    out = []
+    for label, checks in (("Day 1", r["checks_now"]), ("Future", r["checks_fut"])):
+        out += [("Shortfall", f"{label}: {t}") for bad, t in checks if bad]
+    cells = comparison_flags(r)
+    if cells:
+        where = ", ".join(RATIO_CELL_NAMES[c] for c in sorted(cells))
+        out.append(("Above guidance", f"vCPU:pCPU above the {hv_label(r)} ({where})."))
+    out += [("NUMA", t) for bad, t in numa_messages(r) if bad]
+    return out
+
+
+def report_body(single_html, prefix):
+    """Hero + sections of a single-cluster report, with ids prefixed so tabs don't collide."""
+    body = single_html[single_html.index('<header class="hero"'):single_html.index("<footer>")]
+    return re.sub(r'id="([^"]+)"', lambda m: f'id="{prefix}-{m.group(1)}"', body)
+
+
+def generate_consolidated_report(items, customer, customer_logo_uri=None):
+    """items: [{"label", "kind": "cluster"|"scenario", "r", "html"}]. Clusters feed the totals;
+    scenarios (consolidations / All Clusters) get their own tab but are left out of the totals."""
+    e = lambda v: escape(str(v))  # noqa: E731
+    f0 = lambda x: f"{x:,.0f}"  # noqa: E731
+    ratio = lambda v, c: f"{v / c:.1f}:1" if c else "n/a"  # noqa: E731
+    pct = lambda a, b: f"{a / b:.0%}" if b else "n/a"  # noqa: E731
+    plural = lambda n, w: f"{n:,} {w}{'' if n == 1 else 's'}"  # noqa: E731
+    now = datetime.now()
+    ahead_white = file_data_uri(WHITE_LOGO_PATH)
+    clusters = [i for i in items if i["kind"] == "cluster"] or items[:1]
+    scenarios = [i for i in items if i not in clusters]
+    for n, it in enumerate(items):
+        it["tab"] = f"t{n}"
+        it["flags"] = report_flags(it["r"])
+    R = [c["r"] for c in clusters]
+    lic_host = lambda r: license_cores_per_host(r["sockets"], r["cores"])  # noqa: E731
+    cur_h, d1_h, fu_h = (sum(r[k] for r in R) for k in ("cur_host_count", "hosts_now", "hosts_fut"))
+    cur_c = sum(r["cur_cores"] for r in R)
+    d1_c, fu_c = sum(r["hosts_now"] * r["host_cores"] for r in R), sum(r["hosts_fut"] * r["host_cores"] for r in R)
+    cur_m = sum(r["cur_total_ram_gb"] for r in R)
+    d1_m, fu_m = sum(r["hosts_now"] * r["ram"] for r in R), sum(r["hosts_fut"] * r["ram"] for r in R)
+    vcpu, vram, fvcpu, fvram = (sum(r[k] for r in R) for k in ("tot_vcpu", "tot_ram", "fut_vcpu", "fut_ram"))
+    vms = sum(r["tot_vms"] for r in R)
+    cur_l, d1_l, fu_l = sum(r["cur_lic_cores"] for r in R), sum(r["hosts_now"] * lic_host(r) for r in R), sum(r["fut_lic_cores"] for r in R)
+    prov, inuse = sum(r["vm_prov_tb"] for r in R), sum(r["vm_used_tb"] for r in R)
+    dscap, dsused = sum(r["storage"]["cap"] for r in R), sum(r["storage"]["used"] for r in R)
+    hvs = sorted({r["hypervisor"] for r in R})
+    flagged = [c for c in clusters if c["flags"]]
+    n_flags = sum(len(c["flags"]) for c in clusters)
+    nlabel = plural(len(clusters), "cluster")
+
+    def go(it, text=None):
+        return f"<a href='#{it['tab']}' onclick=\"showTab('{it['tab']}');return false;\">{e(text or it['label'])}</a>"
+
+    # ---- Summary: hero ----
+    stats = [(plural(d1_h, "host"), f"Day 1 across {nlabel} (today {f0(cur_h)})"),
+             (plural(fu_h, "host"), "Future requirement with growth"),
+             (f"{f0(vcpu)} vCPU", f"{f0(vms)} VMs · {f0(vram)} GB vRAM today"),
+             (f"{d1_l - cur_l:+,}" if d1_l != cur_l else "±0", f"Net licensed cores, Day 1 ({f0(cur_l)} → {f0(d1_l)})")]
+    stats_html = "".join(f"<div class='stat'><div class='num'>{e(a)}</div><div class='cap'>{e(b)}</div></div>" for a, b in stats)
+    prepared = (f"<div class='chip'><img src='{customer_logo_uri}' alt='{e(customer)}'></div>"
+                if customer_logo_uri else f"<div class='chip'>{e(customer)}</div>")
+    scen_txt = (f" {plural(len(scenarios), 'consolidation scenario')} {'is' if len(scenarios) == 1 else 'are'} shown in "
+                f"{'its' if len(scenarios) == 1 else 'their'} own tab{'s' if len(scenarios) != 1 else ''} and not added to the totals."
+                if scenarios else "")
+
+    totals = [("Clusters", str(len(clusters)), str(len(clusters)), str(len(clusters))),
+              ("Hosts", f0(cur_h), f0(d1_h), f0(fu_h)),
+              ("Physical cores", f0(cur_c), f0(d1_c), f0(fu_c)),
+              ("Host RAM", f"{f0(cur_m)} GB", f"{f0(d1_m)} GB", f"{f0(fu_m)} GB"),
+              ("Workload", f"{f0(vcpu)} vCPU | {f0(vram)} GB", f"{f0(vcpu)} vCPU | {f0(vram)} GB",
+               f"{f0(fvcpu)} vCPU | {f0(fvram)} GB"),
+              ("vCPU:pCPU (all hosts)", ratio(vcpu, cur_c), ratio(vcpu, d1_c), ratio(fvcpu, fu_c)),
+              ("vRAM / host RAM", pct(vram, cur_m), pct(vram, d1_m), pct(fvram, fu_m)),
+              ("Licensed cores", f0(cur_l), f0(d1_l), f0(fu_l))]
+    totals_html = ("<table class='compare'><tr><th></th><th>Current</th><th>Recommended (Day 1)</th><th>Future</th></tr>"
+                   + "".join(f"<tr><td>{e(a)}</td><td>{e(b)}</td><td class='hl'>{e(c)}</td><td>{e(d)}</td></tr>"
+                             for a, b, c, d in totals) + "</table>")
+
+    def status(it):
+        n = len(it["flags"])
+        return "<span class='pill ok'>No issues</span>" if not n else f"<span class='pill warn'>{plural(n, 'flag')}</span>"
+
+    def row(it, total=False):
+        r = it["r"]
+        tag = " <span class='tag mini'>override</span>" if r["override_now"] else ""
+        return (f"<tr><td>{go(it)}</td><td>{e(r['hypervisor'])}</td><td>{f0(r['tot_vms'])}</td><td>{f0(r['cur_host_count'])}</td>"
+                f"<td class='hl'>{r['hosts_now']}{tag}</td><td>{r['hosts_fut']}</td><td>{fmt_ratio(r['ratio_now_failover'])}</td>"
+                f"<td>{e(r['constraint'])}</td><td>{status(it)}</td></tr>")
+    head = ("<tr><th>{}</th><th>Hypervisor</th><th>VMs</th><th>Current hosts</th><th>Day 1 hosts</th><th>Future hosts</th>"
+            "<th>Day 1 failover ratio</th><th>Constraint</th><th>Status</th></tr>")
+    all_clear = "" if n_flags else "<span class='pill ok'>All clear</span>"
+    by_html = ("<table class='compare'>" + head.format("Cluster") + "".join(row(c) for c in clusters)
+               + f"<tr class='total'><td>Total</td><td>{e(', '.join(hvs))}</td><td>{f0(vms)}</td><td>{f0(cur_h)}</td>"
+               f"<td class='hl'>{f0(d1_h)}</td><td>{f0(fu_h)}</td><td>{ratio(vcpu, d1_c)} all hosts</td><td></td>"
+               f"<td>{all_clear}</td></tr></table>")
+    scen_html = ""
+    if scenarios:
+        scen_html = ("<h3>Consolidation scenarios</h3><p class='foot' style='margin-top:-6px'>Alternative ways to size the "
+                     "same clusters. Not included in the totals above.</p><div class='table-card scroll'><table class='compare'>"
+                     + head.format("Scenario") + "".join(row(s) for s in scenarios) + "</table></div>")
+
+    flag_cards = "".join(
+        f"<div class='card'><div class='label'>{go(it, it['label'] + ' →')}</div><ul class='flags'>"
+        + "".join(f"<li><span class='ftype'>{e(k)}</span>{e(t)}</li>" for k, t in it["flags"]) + "</ul></div>"
+        for it in items if it["flags"])
+    clean = [c["label"] for c in clusters if not c["flags"]]
+    flags_html = ((f"<div class='cards two'>{flag_cards}</div>" if flag_cards else
+                   "<div class='note'><strong>All clear.</strong> No shortfalls, ratios above guidance or wide VMs.</div>")
+                  + (f"<div class='note'><strong>No issues:</strong> {e(', '.join(clean))}.</div>" if clean and flag_cards else ""))
+
+    summary = f"""
+<header class="hero"><div class="wrap">
+  <div class="prepared"><span class="eyebrow muted">Prepared for</span>{prepared}
+    <span class="divider"></span><span class="eyebrow muted">Scope</span><div class="chip">{e(nlabel)}</div></div>
+  <div class="eyebrow kicker">Solution summary · {e(' / '.join(hvs))} · {now:%b %d, %Y}</div>
+  <h1>{e(customer)} host sizing: <em>the whole estate</em></h1>
+  <p class="lede">{e(nlabel)} run {f0(vms)} VMs on {f0(cur_h)} hosts today. The recommendation is {plural(d1_h, 'host')} on
+    Day 1, growing to {f0(fu_h)} with growth. Each cluster has its own tab with the full sizing.{e(scen_txt)}</p>
+  <div class="stats">{stats_html}</div>
+  <div class="meta"><span class="dot"></span>Generated {now:%b %d, %Y, %I:%M %p} · {e(APP_TITLE)} v{APP_VERSION}</div>
+</div></header>
+<section><div class="wrap">
+  <div class="eyebrow">Solution totals</div><h2>Current vs. Recommended</h2>
+  <p class="section-lede">Totals across {e(nlabel)}. Ratios are worked out from the totals, so they show the overall density.</p>
+  <div class="table-card">{totals_html}</div>
+</div></section>
+<section class="alt"><div class="wrap">
+  <div class="eyebrow">By cluster</div><h2>Cluster Comparison</h2>
+  <p class="section-lede">Select a name to open its full sizing.</p>
+  <div class="table-card scroll">{by_html}</div>
+  <p class="foot">Override = host count set manually. Day 1 failover ratio = vCPU:pCPU with the HA hosts failed.</p>
+  {scen_html}
+</div></section>
+<section><div class="wrap">
+  <div class="eyebrow">Licensing &amp; storage</div><h2>Roll-up</h2>
+  <div class="cards">
+    <div class="card navy"><div class="label">Licensed cores today</div><div class="big">{f0(cur_l)}</div><p>Across {plural(cur_h, 'current host')}.</p></div>
+    <div class="card"><div class="label">Licensed cores Day 1</div><div class="big">{f0(d1_l)}</div><p>Future: {f0(fu_l)} cores.</p></div>
+    <div class="card {'green' if d1_l <= cur_l else ''}"><div class="label">Net change Day 1</div><div class="big">{d1_l - cur_l:+,}</div>
+      <span class='pill {'ok' if d1_l <= cur_l else 'info'}'>{'Fewer or same cores' if d1_l <= cur_l else 'More cores to license'}</span></div>
+  </div>
+  <div class="cards" style="margin-top:20px">
+    <div class="card"><div class="label">VMDK provisioned</div><div class="big">{prov:,.1f} <small>TB</small></div><p>In use: {inuse:,.1f} TB.</p></div>
+    <div class="card"><div class="label">Datastore capacity</div><div class="big">{dscap:,.1f} <small>TB</small></div><p>Used: {dsused:,.1f} TB ({pct(dsused, dscap)}).</p></div>
+    <div class="card green"><div class="label">Headroom</div><div class="big">{dscap - dsused:,.1f} <small>TB</small></div><p>Free datastore capacity.</p></div>
+  </div>
+  <div class="note"><strong>Note:</strong> shared datastores can appear in more than one cluster, so the datastore total may count some
+    capacity twice. VMDK totals are per VM and don't overlap.</div>
+</div></section>
+<section class="alt"><div class="wrap">
+  <div class="eyebrow">Risks &amp; flags</div><h2>What needs attention</h2>
+  <p class="section-lede">{plural(n_flags, 'item')} across {plural(len(flagged), 'cluster')}: design-check shortfalls, ratios above
+    hypervisor guidance and VMs wider than a socket.</p>
+  {flags_html}
+</div></section>"""
+
+    panels = [f'<div class="tabpanel" id="summary" role="tabpanel">{summary}</div>']
+    tabs = ['<button class="tab" data-tab="summary" role="tab">Summary</button>']
+    for it in items:
+        panels.append(f'<div class="tabpanel" id="{it["tab"]}" role="tabpanel" hidden>{report_body(it["html"], it["tab"])}</div>')
+        kind = "<span class='kind'>scenario</span>" if it in scenarios else ""
+        dot = "<span class='tdot'></span>" if it["flags"] else ""
+        tabs.append(f'<button class="tab" data-tab="{it["tab"]}" role="tab">{e(it["label"])}{kind}{dot}</button>')
+    logo_img = f'<img src="{ahead_white}" alt="AHEAD">' if ahead_white else "AHEAD"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Host Sizing - {e(customer)} - Consolidated | AHEAD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=PT+Serif:ital@1&display=swap" rel="stylesheet">
+<style>{REPORT_CSS}{CONSOLIDATED_CSS}</style></head>
+<body>
+<nav class="topnav"><div class="wrap">
+  <a class="brand" href="#summary" onclick="showTab('summary');return false;">{logo_img}</a>
+  <span style="color:rgba(255,255,255,.8);font-size:14px">{e(customer)} · Consolidated sizing</span>
+  <button class="btn" onclick="window.print()">Print / Save PDF</button>
+</div></nav>
+<div class="tabbar"><div class="wrap" role="tablist">{''.join(tabs)}</div></div>
+{''.join(panels)}
+<footer><div class="wrap">{logo_img}<span>Confidential - Proprietary to AHEAD · Prepared for {e(customer)}</span>
+<span>{e(nlabel)}{' · ' + plural(len(scenarios), 'scenario') if scenarios else ''}</span></div></footer>
+{CONSOLIDATED_JS}
+</body></html>"""
+
+
+
+# =============================================================================
 # 7. STREAMLIT UI
 # =============================================================================
 PRODUCT_NAME = "Host Sizer"
@@ -1361,7 +1597,7 @@ DEFAULTS = {
     "override": False, "override_hosts": 4, "override_future": True,
     "include_off": True, "growth_pct": 10.0, "years": 3,
     "customer": "My Customer", "scope": [],
-    "cmp_view": "Both", "raw_view": "VMs", "raw_cols": "Key columns", "raw_search": "",
+    "cmp_view": "Both", "preview_view": "Consolidated", "upload_mode": "Add to active project", "raw_view": "VMs", "raw_cols": "Key columns", "raw_search": "",
 }
 PARAM_KEYS = ["hypervisor", "sockets", "cores", "ram", "clock", "lo_basis", "vcpu_ratio", "cpu_buffer", "ram_buffer",
               "min_hosts", "ha_nodes", "override", "override_hosts", "override_future",
@@ -1464,15 +1700,15 @@ def customer_logo_uri():
 def report_summary(entry):
     """Quick facts for a Home tile."""
     try:
-        source, sheets = entry_sheets(entry)
+        facts = [source_facts(src) for src in entry_sources(entry)]
     except Exception:  # noqa: BLE001
         return None, "Could not read file"
-    if source is None:
+    if any(f[0] is None for f in facts):
         return None, "Not an RVTools or Live Optics export"
-    vm_sheet, host_sheet = ("vInfo", "vHost") if source == "RVTools" else ("VMs", "ESX Hosts")
-    vms = len(drop_templates(sheets[vm_sheet]))
-    hosts = len(sheets.get(host_sheet, []))
-    return source, f"{hosts:,} hosts · {vms:,} VMs · {len(cluster_list(source, sheets))} clusters"
+    n = len(facts)
+    lead = f"{n} sources · " if n > 1 else ""
+    return (type_label(f[0] for f in facts),
+            f"{lead}{sum(f[2] for f in facts):,} hosts · {sum(f[3] for f in facts):,} VMs · {sum(f[1] for f in facts)} clusters")
 
 
 def safe_filename_part(text):
@@ -1486,21 +1722,363 @@ def report_file_name(customer, cluster):
     return f"{safe_filename_part(customer)}-{safe_filename_part(cluster)}-AHEAD Sizing.html"
 
 
+# ---------- multiple sources per project ----------
+SRC_SEP = " · "          # cluster id = "<source alias> · <cluster>" when a project has 2+ sources
+VCENTER_COLS = {"RVTools": ("vInfo", ["VI SDK Server", "vCenter", "VC Name"]),
+                "LiveOptics": ("ESX Hosts", ["vCenter", "vCenter Name", "VCenter", "vCenter Server"])}
+VM_NAME_COLS = {"RVTools": ("vInfo", "VM"), "LiveOptics": ("VMs", "VM Name")}
+HOST_COLS = {"RVTools": ("vHost", ["Host"]), "LiveOptics": ("ESX Hosts", HOST_NAME_COLS)}
+
+
+def new_source(file_name, data=None, sha=None, stype=None, sheets=None, alias=None, enabled=True):
+    src = {"uid": uuid.uuid4().hex[:10], "file_name": file_name, "sha256": sha, "alias": alias, "enabled": enabled}
+    if sheets is not None:
+        src.update(type=stype, sheets=sheets)
+    else:
+        src["bytes"] = data
+    return src
+
+
+def entry_sources(entry):
+    """Sources of a session report/project (older single-file entries are converted in place)."""
+    if "sources" not in entry:
+        if entry.get("sheets") is not None:
+            src = new_source(entry.get("file_name", ""), stype=entry.get("source"), sheets=entry["sheets"], sha=entry.get("sha256"))
+        else:
+            src = new_source(entry.get("file_name", ""), data=entry.get("bytes"), sha=entry.get("sha256"))
+        entry["sources"] = [src]
+    for src in entry["sources"]:
+        if not src.get("alias"):
+            src["alias"] = default_alias(src, [s.get("alias") for s in entry["sources"] if s is not src])
+    return entry["sources"]
+
+
+def source_data(src):
+    """(type, sheets) for one source; type is None if the file isn't a recognised export."""
+    if src.get("sheets") is not None:
+        return src["type"], src["sheets"]
+    stype, sheets = load_workbook(src["bytes"])
+    src["type"] = stype
+    return stype, sheets
+
+
+def default_alias(src, taken=()):
+    """Short name for a source: the vCenter host name in the export, else a tidied file name."""
+    name = ""
+    try:
+        stype, sheets = source_data(src)
+        sheet, cols = VCENTER_COLS.get(stype, (None, []))
+        df = sheets.get(sheet) if sheet else None
+        for col in (cols if df is not None else []):
+            if col in df.columns:
+                vals = df[col].dropna().astype(str).str.strip()
+                vals = vals[vals.str.len() > 0]
+                cand = str(mode_or(vals, ""))
+                if cand and " " not in cand:          # a host name or IP, not a product/version string
+                    name = cand.split(".")[0] if not cand.replace(".", "").isdigit() else cand
+                    break
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name:
+        stem = os.path.splitext(src.get("file_name") or "Source")[0]
+        stem = re.sub(r"^(?i:liveoptics|rvtools)[_\- ]*(\d+[_\- ]*)?", "", stem)          # LiveOptics_3483554_
+        stem = re.sub(r"[_\- ]*\d{1,4}[_\-]\d{1,2}[_\-]\d{2,4}([_\- ]*\d{1,2}[.:]\d{2}([.:]\d{2})?)?$", "", stem)  # dates/times
+        stem = re.sub(r"[_\- ]*(?i:rvtools|liveoptics|export|all)(?=$|[_\- ])", "", stem)
+        stem = re.sub(r"[_\- ]*(?i:rvtools|liveoptics|export|all)(?=$|[_\- ])", "", stem).strip("_- ")
+        name = (stem or os.path.splitext(src.get("file_name") or "Source")[0])[:28]
+    base, n = name, 2
+    while name in taken:
+        name, n = f"{base} {n}", n + 1
+    return name
+
+
+def source_ids(entry, include_disabled=False):
+    """[(cluster id, source uid, cluster name)] across the project's sources."""
+    srcs = entry_sources(entry)
+    multi = len(srcs) > 1
+    out = []
+    for src in srcs:
+        if not include_disabled and not src.get("enabled", True):
+            continue
+        try:
+            stype, sheets = source_data(src)
+        except Exception:  # noqa: BLE001
+            continue
+        if stype is None:
+            continue
+        for c in cluster_list(stype, sheets):
+            out.append((f"{src['alias']}{SRC_SEP}{c}" if multi else c, src["uid"], c))
+    return out
+
+
+def type_label(types):
+    types = sorted(set(t for t in types if t))
+    return " + ".join(types) if types else "Unknown"
+
+
+def active_scope(entry, scope):
+    """Scope with out-of-scope (inactive) clusters removed. None (all clusters) becomes the list of active
+    clusters when any cluster is inactive. A selection made only of inactive clusters is kept as-is, so
+    Current Environment can still show it."""
+    inactive = set(entry.get("inactive", []))
+    if not inactive:
+        return scope
+    if scope is None:
+        return [cid for cid, _, _ in source_ids(entry) if cid not in inactive]
+    kept = [c for c in scope if c not in inactive]
+    return kept or scope
+
+
+def parse_entry(entry, scope, p):
+    """Inventory for a scope (list of cluster ids, or None for everything) across all enabled sources.
+    Out-of-scope clusters are left out. Returns (inventory, source type label, file names)."""
+    srcs = [s for s in entry_sources(entry) if s.get("enabled", True)]
+    ids = source_ids(entry)
+    everything = scope is None
+    scope = active_scope(entry, scope)
+    clustered = {uid for _, uid, _ in ids}
+    parts = []
+    for src in srcs:
+        stype, sheets = source_data(src)
+        if stype is None:
+            continue
+        if scope is None:
+            local = None
+        elif src["uid"] not in clustered:
+            if not everything:
+                continue
+            local = None                      # no Cluster column: only part of "everything"
+        else:
+            local = [c for cid, uid, c in ids if uid == src["uid"] and cid in scope]
+            if not local:
+                continue
+        inv = (parse_rvtools(sheets, local, p["include_off"]) if stype == "RVTools"
+               else parse_live_optics(sheets, local, p["include_off"], p["lo_basis"]))
+        parts.append((src, stype, inv))
+    if not parts:
+        raise ValueError("None of the enabled sources has data for this selection.")
+    label = type_label(t for _, t, _ in parts)
+    files = ", ".join(s["file_name"] for s, _, _ in parts)
+    if len(parts) == 1 and len(entry_sources(entry)) == 1:
+        return parts[0][2], label, files
+    return merge_inventories(parts), label, files
+
+
+def merge_inventories(parts):
+    """Combine parsed inventories from several sources into one."""
+    invs = [inv for _, _, inv in parts]
+
+    def cat(key, tag=False):
+        frames = []
+        for src, _, inv in parts:
+            df = inv[key].copy()
+            if tag:
+                df.insert(0, "Source", src["alias"])
+            frames.append(df)
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    def joined(key):
+        vals = list(dict.fromkeys(str(i[key]) for i in invs if str(i[key]) not in ("Unknown", "", "None")))
+        return " / ".join(vals) if vals else "Unknown"
+
+    on = [i["vm_on"] for i in invs if i["vm_on"] is not None]
+    off = [i["vm_off"] for i in invs if i["vm_off"] is not None]
+    stor = [i["storage"] for i in invs]
+    has_perf = all(i["has_perf"] for i in invs)
+    notes = list(dict.fromkeys(f"{s['alias']}: {i['storage']['note']}" for s, _, i in parts))
+    return {
+        "vms": cat("vms"), "hosts": cat("hosts"),
+        "storage": {"cap": sum(x["cap"] for x in stor), "used": sum(x["used"] for x in stor),
+                    "free": sum(x["free"] for x in stor), "note": " | ".join(notes)},
+        **{k: sum(i[k] for i in invs) for k in ("vm_prov_tb", "vm_used_tb", "guest_used_tb", "rdm_cnt", "rdm_tb")},
+        "has_perf": has_perf, "perf_ghz": sum(i["perf_ghz"] for i in invs) if has_perf else 0.0,
+        "perf_estimated": any(i["perf_estimated"] for i in invs),
+        "lic_edition": joined("lic_edition"), "esxi_version": joined("esxi_version"),
+        "vm_on": sum(on) if on else None, "vm_off": sum(off) if off else None,
+        "include_off": invs[0].get("include_off", True),
+        "raw_vms": cat("raw_vms", tag=True), "raw_hosts": cat("raw_hosts", tag=True),
+    }
+
+
+def source_facts(src):
+    """(type, n clusters, n hosts, n VMs) for a source tile."""
+    stype, sheets = source_data(src)
+    if stype is None:
+        return None, 0, 0, 0
+    vm_sheet, host_sheet = ("vInfo", "vHost") if stype == "RVTools" else ("VMs", "ESX Hosts")
+    return (stype, len(cluster_list(stype, sheets)), len(sheets.get(host_sheet, [])),
+            len(drop_templates(sheets[vm_sheet])))
+
+
+def source_names(src):
+    """(set of VM names, set of host names) for overlap checks."""
+    stype, sheets = source_data(src)
+    if stype is None:
+        return set(), set()
+    vs, vc = VM_NAME_COLS[stype]
+    hs, hcols = HOST_COLS[stype]
+    vdf, hdf = sheets.get(vs), sheets.get(hs)
+    vms = set(vdf[vc].dropna().astype(str).str.lower()) if vdf is not None and vc in vdf.columns else set()
+    hc = first_col(hdf, hcols) if hdf is not None else None
+    hosts = set(hdf[hc].dropna().astype(str).str.lower()) if hc else set()
+    return vms, hosts
+
+
+def source_overlaps(entry):
+    """[(alias a, alias b, shared VMs, shared hosts)] between enabled sources that look like the same environment."""
+    srcs = [s for s in entry_sources(entry) if s.get("enabled", True)]
+    names = {}
+    for s in srcs:
+        try:
+            names[s["uid"]] = source_names(s)
+        except Exception:  # noqa: BLE001
+            names[s["uid"]] = (set(), set())
+    out = []
+    for i, a in enumerate(srcs):
+        for b in srcs[i + 1:]:
+            v = len(names[a["uid"]][0] & names[b["uid"]][0])
+            h = len(names[a["uid"]][1] & names[b["uid"]][1])
+            if v or h:
+                out.append((a["alias"], b["alias"], v, h))
+    return out
+
+
+def migrate_cluster_ids(entry, before, after):
+    """Re-key per-scope settings after sources are added, removed or renamed.
+    before/after: {(source uid, cluster name): cluster id}. Scopes that lose a cluster are dropped."""
+    mapping = {cid: after.get(k) for k, cid in before.items()}
+    lists = entry.get("scope_lists", {})
+    touched = set(entry.get("touched", []))
+
+    def conv(scope):
+        out = []
+        for c in scope:
+            n = mapping.get(c, c)
+            if n is None:
+                return None
+            out.append(n)
+        return out
+    new_s, new_l, new_t = {}, {}, []
+    for key, vals in entry.get("scope_settings", {}).items():
+        scope = lists.get(key) or ([] if key == ALL_CLUSTERS else key.split(" + "))
+        ns = conv(scope)
+        if ns is None:
+            continue
+        nk = scope_key(ns)
+        new_s[nk], new_l[nk] = vals, sorted(ns)
+        if key in touched:
+            new_t.append(nk)
+    inactive = [mapping.get(c, c) for c in entry.get("inactive", [])]
+    entry.update(scope_settings=new_s, scope_lists=new_l, touched=new_t,
+                 inactive=[c for c in inactive if c],
+                 last_scope=conv(entry.get("last_scope", [])) or [])
+    entry.pop("_bundle", None)
+    return conv
+
+
+def id_map(entry):
+    return {(uid, c): cid for cid, uid, c in source_ids(entry, include_disabled=True)}
+
+
+def change_sources(entry_name, entry, change):
+    """Apply change(entry) to the source list, then re-key settings and the on-screen scope."""
+    ss = st.session_state
+    before = id_map(entry)
+    change(entry)
+    entry_sources(entry)
+    conv = migrate_cluster_ids(entry, before, id_map(entry))
+    if ss.get("active") == entry_name:
+        ss.scope = conv(list(ss.get("scope", []))) or []
+        ss._scope_for = None
+
+
+def scope_params(values):
+    """Full parameter dict for a stored scope (fills gaps with defaults)."""
+    ss = st.session_state
+    p = {k: DEFAULTS[k] for k in SIZING_KEYS}
+    p.update({k: v for k, v in (values or {}).items() if k in SIZING_KEYS})
+    p["lo_basis"] = p["lo_basis"] or DEFAULTS["lo_basis"]
+    p["hypervisor"] = p["hypervisor"] or DEFAULT_HYPERVISOR
+    p["growth"] = p["growth_pct"] / 100
+    p["customer"] = ss.customer
+    return p
+
+
+def report_items(entry):
+    """Every configured scope -> [{"key", "label", "kind", "r", "html", "file_name"}], ordered:
+    single clusters (in source/export order), then consolidations, then All Clusters.
+    All Clusters is included only if it was edited, or if no single cluster has been sized."""
+    store = entry.get("scope_settings", {})
+    lists = entry.get("scope_lists", {})
+    touched = set(entry.get("touched", []))
+    inactive = set(entry.get("inactive", []))
+    clusters = [cid for cid, _, _ in source_ids(entry) if cid not in inactive]
+    order = {c: i for i, c in enumerate(clusters)}
+    keyed = []
+    for key, values in store.items():
+        scope = lists.get(key) or ([] if key == ALL_CLUSTERS else [c for c in key.split(" + ") if c in order])
+        if any(c in inactive for c in scope):
+            continue                                  # selections with an out-of-scope cluster are left out
+        scope = [c for c in scope if c in order]
+        if key != ALL_CLUSTERS and not scope:
+            continue
+        keyed.append((key, scope, values))
+    singles = sorted([k for k in keyed if len(k[1]) == 1], key=lambda k: order[k[1][0]])
+    combos = sorted([k for k in keyed if len(k[1]) > 1], key=lambda k: [order[c] for c in k[1]])
+    allc = [k for k in keyed if k[0] == ALL_CLUSTERS and (ALL_CLUSTERS in touched or not singles)]
+    items = []
+    logo = customer_logo_uri()
+    for key, scope, values in singles + combos + allc:
+        p = scope_params(values)
+        inv, stype, files = parse_entry(entry, scope or None, p)
+        r = compute_sizing(inv, p)
+        label = " + ".join(scope) if scope else ALL_CLUSTERS
+        r.update(scope_label=label, file_name=files, source_type=stype)
+        estate = not scope and not singles          # All Clusters is the whole sizing when nothing else is sized
+        items.append({"key": key, "label": label, "kind": "cluster" if len(scope) == 1 or estate else "scenario", "r": r,
+                      "html": generate_html_report(r, logo), "file_name": report_file_name(p["customer"], label)})
+    return items
+
+
+def report_bundle(entry_name, entry):
+    """Consolidated report + every per-scope report, cached until any setting or source changes."""
+    ss = st.session_state
+    logo = ss.get("cust_logo")
+    sig = json.dumps({"s": entry.get("scope_settings", {}), "l": entry.get("scope_lists", {}),
+                      "i": sorted(entry.get("inactive", [])),
+                      "t": sorted(entry.get("touched", [])), "c": ss.customer,
+                      "src": [(x["uid"], x["alias"], x.get("enabled", True)) for x in entry_sources(entry)],
+                      "logo": hashlib.sha256(logo["bytes"]).hexdigest() if logo else None,
+                      "e": entry_name, "v": APP_VERSION}, sort_keys=True, default=str)
+    cached = entry.get("_bundle")
+    if cached and cached[0] == sig:
+        return cached[1]
+    items = report_items(entry)
+    bundle = {"items": items,
+              "html": generate_consolidated_report(items, ss.customer, customer_logo_uri()) if items else None,
+              "file_name": report_file_name(ss.customer, "Consolidated")}
+    entry["_bundle"] = (sig, bundle)
+    return bundle
+
+
 def build_context():
-    """Parse the active report and run the sizing with the current parameters."""
+    """Parse the active project's sources and run the sizing with the current parameters."""
     ss = st.session_state
     name = ss.get("active")
     if not name or name not in ss.reports:
         return None
     entry = ss.reports[name]
     try:
-        source, sheets = entry_sheets(entry)
+        srcs = entry_sources(entry)
+        bad = [s["file_name"] for s in srcs if source_data(s)[0] is None]
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"Could not read '{name}'. Is it a valid .xlsx export?", "exc": exc, "name": name}
-    if source is None:
-        return {"error": f"'{name}' is not an RVTools export (vInfo tab) or a Live Optics export "
-                         f"(VMs + ESX Hosts tabs).", "exc": None, "name": name}
-    clusters = cluster_list(source, sheets)
+        return {"error": f"Could not read a file in '{name}'. Is it a valid .xlsx export?", "exc": exc, "name": name}
+    if bad:
+        return {"error": f"{', '.join(bad)} is not an RVTools export (vInfo tab) or a Live Optics export "
+                         f"(VMs + ESX Hosts tabs). Remove it from the project on Home.", "exc": None, "name": name}
+    if not any(s.get("enabled", True) for s in srcs):
+        return {"error": f"All sources in '{name}' are excluded. Include at least one on Home.", "exc": None, "name": name}
+    clusters = [cid for cid, _, _ in source_ids(entry)]
     ss.scope = [c for c in ss.scope if c in clusters]
     if len(clusters) == 1:
         ss.scope = [clusters[0]]          # one cluster: select it rather than "All Clusters"
@@ -1509,19 +2087,26 @@ def build_context():
     scope_label = ALL_CLUSTERS if scope is None else " + ".join(scope)
     p = params_from_state()
     try:
-        if source == "RVTools":
-            inv = parse_rvtools(sheets, scope, p["include_off"])
-        else:
-            inv = parse_live_optics(sheets, scope, p["include_off"], p["lo_basis"])
+        inv, stype, files = parse_entry(entry, scope, p)
         r = compute_sizing(inv, p)
-        r.update(scope_label=scope_label, file_name=entry.get("file_name", name), source_type=source)
+        r.update(scope_label=scope_label, file_name=files, source_type=stype)
         html = generate_html_report(r, customer_logo_uri())
     except KeyError as exc:
         return {"error": f"A required column or tab is missing from '{name}': {exc}", "exc": exc, "name": name}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Error processing '{name}': {exc}", "exc": exc, "name": name}
     report_name = report_file_name(p["customer"], scope_label)
-    return {"key": name, "name": entry.get("project_name") or name, "source": source, "sheets": sheets, "clusters": clusters, "inv": inv, "r": r,
+    try:
+        bundle = report_bundle(name, entry)
+    except Exception as exc:  # noqa: BLE001 - the single report still works
+        bundle = {"items": [], "html": None, "file_name": "", "error": str(exc)}
+    display = entry.get("project_name") or (name if len(srcs) == 1 else
+                                            f"{srcs[0]['file_name']} + {len(srcs) - 1} more source{'s' if len(srcs) > 2 else ''}")
+    inactive = set(entry.get("inactive", []))
+    out_of_scope = bool(ss.scope) and all(c in inactive for c in ss.scope)
+    return {"bundle": bundle, "key": name, "name": display, "source": stype, "inactive": inactive,
+            "out_of_scope": out_of_scope,
+            "sources": srcs, "clusters": clusters, "inv": inv, "r": r,
             "html": html, "file_name": report_name, "error": None}
 
 
@@ -1586,7 +2171,8 @@ def page_header(title, subtitle="", ctx=None):
         if ctx and not ctx["error"]:
             r = ctx["r"]
             badges = [f":violet-badge[:material/layers: {r['hypervisor']} · {r['hv_ratio']:.1f}:1]",
-                      f":blue-badge[:material/description: {ctx['source']}]",
+                      f":blue-badge[:material/description: {ctx['source']}]"
+                      + (f" :blue-badge[:material/stacks: {len(ctx['sources'])} sources]" if len(ctx.get('sources', [])) > 1 else ""),
                       f":gray-badge[:material/hub: {r['scope_label']}]"]
             if r["override_now"]:
                 badges.append(":orange-badge[:material/lock: Host count override]")
@@ -1596,10 +2182,34 @@ def page_header(title, subtitle="", ctx=None):
             st.markdown(" ".join(badges))
     with right:
         if ctx and not ctx["error"]:
-            st.download_button("Download report", ctx["html"], file_name=ctx["file_name"], mime="text/html",
-                               type="primary", icon=":material/download:", width="stretch")
+            render_downloads(ctx)
             save_popover()
     st.divider()
+
+
+def render_downloads(ctx):
+    """Primary: consolidated report (all sized clusters). Secondary: any single cluster/scenario report."""
+    bundle = ctx.get("bundle") or {}
+    items = bundle.get("items") or []
+    if not bundle.get("html"):
+        st.download_button("Download report", ctx["html"], file_name=ctx["file_name"], mime="text/html",
+                           type="primary", icon=":material/download:", width="stretch")
+        return
+    n = len(items)
+    st.download_button("Download consolidated report", bundle["html"], file_name=bundle["file_name"], mime="text/html",
+                       type="primary", icon=":material/download:", width="stretch", key="dl_consolidated",
+                       help=f"Summary tab plus {n} cluster tab{'s' if n != 1 else ''} in one file.")
+    with st.popover("Single reports", icon=":material/description:", width="stretch"):
+        st.caption("Download one cluster or consolidation scenario on its own.")
+        listed = set()
+        for it in items:
+            listed.add(it["key"])
+            st.download_button(it["label"] + (" · scenario" if it["kind"] == "scenario" else ""), it["html"],
+                               file_name=it["file_name"], mime="text/html", key=f"dl_{it['key']}", width="stretch",
+                               icon=":material/download:")
+        if scope_key(st.session_state.scope) not in listed:
+            st.download_button(f"This selection: {ctx['r']['scope_label']}", ctx["html"], file_name=ctx["file_name"],
+                               mime="text/html", key="dl_current", width="stretch", icon=":material/download:")
 
 
 def context_subtitle(ctx):
@@ -1611,19 +2221,52 @@ def context_subtitle(ctx):
 def scope_bar(ctx):
     if not ctx["clusters"]:
         return
-    help_txt = "None selected = all clusters. Pick several clusters to model a consolidation."
+    ss = st.session_state
+    inactive = ctx.get("inactive", set())
+    help_txt = ("None selected = all clusters. Pick several clusters to model a consolidation. "
+                "Clusters marked 'out of scope' are left out of every sizing and report.")
+    fmt = lambda c: f"{c} · out of scope" if c in inactive else c  # noqa: E731
     if len(ctx["clusters"]) <= 20:
-        st.pills("Cluster scope", ctx["clusters"], selection_mode="multi", key="scope", help=help_txt)
+        st.pills("Cluster scope", ctx["clusters"], selection_mode="multi", key="scope", help=help_txt, format_func=fmt)
     else:
-        st.multiselect("Cluster scope", ctx["clusters"], key="scope", help=help_txt, placeholder="All clusters")
-    if len(st.session_state.scope) > 1:
-        st.caption(f":material/merge: Consolidation scope: combining {len(st.session_state.scope)} clusters.")
+        st.multiselect("Cluster scope", ctx["clusters"], key="scope", help=help_txt, placeholder="All clusters",
+                       format_func=fmt)
+    if len(ss.scope) == 1 and len(ctx["clusters"]) > 1:
+        cid = ss.scope[0]
+        ss.cluster_active = cid not in inactive
+        st.toggle(f"Active: include {cid} in the sizing", key="cluster_active", on_change=_set_cluster_active,
+                  args=(ctx["key"], cid),
+                  help="Turn off to take this cluster out of scope. It won't be sized, can't be configured, "
+                       "and is left out of All Clusters, consolidations and every report.")
+    if ctx.get("out_of_scope"):
+        st.markdown(":gray-badge[:material/block: Out of scope] This cluster is excluded from every sizing and report. "
+                    "Turn **Active** on to include it again.")
+    elif len(ss.scope) > 1:
+        dropped = [c for c in ss.scope if c in inactive]
+        n_in = len(ss.scope) - len(dropped)
+        st.caption(f":material/merge: Consolidation scope: combining {n_in} cluster{'s' if n_in != 1 else ''}."
+                   + (f" Out of scope and left out: {', '.join(dropped)}." if dropped else ""))
+    if inactive and len(ctx["clusters"]) > 1:
+        st.caption(f":material/block: Out of scope: {', '.join(c for c in ctx['clusters'] if c in inactive)}")
     store = st.session_state.reports[ctx["key"]].get("scope_settings", {})
     current = scope_key(st.session_state.scope)
     if len(ctx["clusters"]) > 1:
         tags = " ".join(f":{'blue' if k == current else 'gray'}-badge[{k}]" for k in sorted(store))
         st.caption(":material/tune: Sizing settings are kept separately for each cluster selection. "
                    f"Configured: {tags}")
+
+
+def _set_cluster_active(entry_name, cid):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    inactive = [c for c in entry.get("inactive", []) if c != cid]
+    if not ss.get("cluster_active"):
+        if len(set(inactive) | {cid}) >= len(source_ids(entry)):
+            flash("error", "At least one cluster has to stay active.")
+            return
+        inactive.append(cid)
+    entry["inactive"] = inactive
+    entry.pop("_bundle", None)
 
 
 def require_report(title):
@@ -1678,21 +2321,31 @@ def sync_scope_settings(entry_name, entry):
         if key in store:
             load_sizing(store[key])
         ss._scope_for = (entry_name, key)
+    elif key in store and store[key] != sizing_snapshot() and key not in entry.setdefault("touched", []):
+        entry["touched"].append(key)       # the user changed a setting on this selection
     store[key] = sizing_snapshot()
+    entry.setdefault("scope_lists", {})[key] = sorted(ss.scope)
     entry["last_scope"] = list(ss.scope)
     entry["customer"] = ss.customer
 
 
 def project_settings(entry):
     """Everything a project stores about the user's choices (deep copy)."""
-    return copy.deepcopy({"customer": st.session_state.customer,
-                          "scope_settings": entry.get("scope_settings", {}),
-                          "last_scope": entry.get("last_scope", [])})
+    return project_settings_for(st.session_state.customer, entry)
+
+
+def project_settings_for(customer, entry):
+    return copy.deepcopy({"customer": customer, "scope_settings": entry.get("scope_settings", {}),
+                          "scope_lists": entry.get("scope_lists", {}), "touched": sorted(entry.get("touched", [])),
+                          "last_scope": entry.get("last_scope", []),
+                          "inactive": sorted(entry.get("inactive", [])),
+                          "sources": [[x["uid"], x["alias"], x.get("enabled", True)] for x in entry.get("sources", [])]})
 
 
 def settings_fingerprint(settings):
     """Part of the settings that counts as a change (which scope is on screen does not)."""
-    return {"customer": settings.get("customer"), "scope_settings": settings.get("scope_settings")}
+    return {"customer": settings.get("customer"), "scope_settings": settings.get("scope_settings"),
+            "sources": settings.get("sources"), "inactive": settings.get("inactive", [])}
 
 
 def _activate_report(name):
@@ -1711,19 +2364,14 @@ def flash(kind, msg):
     st.session_state._flash = (kind, msg)
 
 
-def entry_sheets(entry):
-    """(source, sheets) for a session report: saved projects carry reduced sheets, uploads carry bytes."""
-    if entry.get("sheets") is not None:
-        return entry["source"], entry["sheets"]
-    return load_workbook(entry["bytes"])
-
-
 def default_project_name(entry_name):
     entry = st.session_state.reports.get(entry_name, {})
     if entry.get("project_name"):
         return entry["project_name"]
-    base = os.path.splitext(entry.get("file_name", entry_name))[0]
-    return f"{st.session_state.customer} - {base}"
+    srcs = entry_sources(entry) if entry else []
+    base = os.path.splitext(srcs[0]["file_name"] if srcs else entry_name)[0]
+    more = f" + {len(srcs) - 1} more" if len(srcs) > 1 else ""
+    return f"{st.session_state.customer} - {base}{more}"
 
 
 def _save_project():
@@ -1735,15 +2383,16 @@ def _save_project():
         return
     entry = ss.reports[key]
     try:
-        source, sheets = entry_sheets(entry)
-        reduced = reduce_sheets(source, sheets)
-        # Guard: the reduced data must produce exactly the same sizing as the full export.
+        srcs = entry_sources(entry)
+        reduced = []
+        for src in srcs:
+            stype, sheets = source_data(src)
+            reduced.append({**{k: v for k, v in src.items() if k not in ("bytes", "sheets", "_bundle")},
+                            "type": stype, "sheets": reduce_sheets(stype, sheets)})
+        # Guard: the reduced data must produce exactly the same sizing as the full exports.
         p, scope = params_from_state(), (ss.scope or None)
-        def run(sh):
-            inv = (parse_rvtools(sh, scope, p["include_off"]) if source == "RVTools"
-                   else parse_live_optics(sh, scope, p["include_off"], p["lo_basis"]))
-            return compute_sizing(inv, p)
-        full_r, small_r = run(sheets), run(reduced)
+        full_r = compute_sizing(parse_entry(entry, scope, p)[0], p)
+        small_r = compute_sizing(parse_entry({**entry, "sources": reduced}, scope, p)[0], p)
         diffs = [k for k in VERIFY_KEYS if abs((full_r[k] or 0) - (small_r[k] or 0)) > 1e-6]
         if diffs:
             flash("error", f"Not saved: trimming the data changed {', '.join(diffs)}. Please report this.")
@@ -1764,8 +2413,9 @@ def _save_project():
             "settings": project_settings(entry),
             "customer_logo": ({"type": logo["type"], "name": logo["name"],
                                "b64": base64.b64encode(logo["bytes"]).decode()} if logo else None),
-            "source": {"type": source, "file_name": entry.get("file_name", key),
-                       "sha256": entry.get("sha256"), "sheets": frames_to_json(reduced)},
+            "sources": [{"uid": r["uid"], "alias": r["alias"], "enabled": r.get("enabled", True), "type": r["type"],
+                         "file_name": r["file_name"], "sha256": r.get("sha256"), "sheets": frames_to_json(r["sheets"])}
+                        for r in reduced],
             "summary": {"customer": ss.customer, "hypervisor": full_r["hypervisor"],
                         "hosts": full_r["cur_host_count"], "vms": full_r["tot_vms"],
                         "hosts_now": full_r["hosts_now"], "scope": " + ".join(ss.scope) or ALL_CLUSTERS,
@@ -1786,7 +2436,15 @@ def _open_project(path):
     ss = st.session_state
     try:
         payload = read_project(path)
-        sheets = frames_from_json(payload["source"]["sheets"])
+        if "sources" in payload:                         # v3: several sources per project
+            sources = [new_source(x["file_name"], stype=x["type"], sheets=frames_from_json(x["sheets"]),
+                                  sha=x.get("sha256"), alias=x.get("alias"), enabled=x.get("enabled", True))
+                       for x in payload["sources"]]
+            for src, x in zip(sources, payload["sources"]):
+                src["uid"] = x.get("uid") or src["uid"]
+        else:                                            # v1/v2: one source
+            x = payload["source"]
+            sources = [new_source(x["file_name"], stype=x["type"], sheets=frames_from_json(x["sheets"]), sha=x.get("sha256"))]
     except Exception as exc:  # noqa: BLE001
         flash("error", f"Could not open {os.path.basename(path)}: {exc}")
         return
@@ -1806,13 +2464,14 @@ def _open_project(path):
     logo = payload.get("customer_logo")
     ss.cust_logo = ({"type": logo["type"], "name": logo.get("name", "logo"),
                      "bytes": base64.b64decode(logo["b64"])} if logo else None)
-    entry = {"sheets": sheets, "source": payload["source"]["type"],
-             "file_name": payload["source"]["file_name"], "sha256": payload["source"].get("sha256"),
+    entry = {"sources": sources, "file_name": sources[0]["file_name"],
              "uploaded": datetime.now(), "project_path": path, "project_name": name,
              "scope_settings": copy.deepcopy(scope_settings), "last_scope": list(last_scope), "customer": customer,
+             "scope_lists": copy.deepcopy(settings.get("scope_lists", {})), "touched": list(settings.get("touched", [])),
+             "inactive": list(settings.get("inactive", [])),
              "saved_logo": bool(logo), "saved_at": payload.get("saved")}
-    entry["saved_settings"] = copy.deepcopy({"customer": customer, "scope_settings": scope_settings,
-                                             "last_scope": list(last_scope)})
+    entry_sources(entry)
+    entry["saved_settings"] = project_settings_for(customer, entry)
     ss.reports[key] = entry
     _activate_report(key)
     load_sizing(scope_settings.get(scope_key(last_scope)))
@@ -1977,18 +2636,125 @@ def render_sidebar():
 
 
 # ---------- pages ----------
+def uploader_key():
+    return f"uploader_{st.session_state.get('_up_n', 0)}"
+
+
 def _ingest_uploads():
+    """New project from the uploaded file(s), or add them as sources to the active project."""
     ss = st.session_state
-    files = ss.get("uploader") or []
-    for f in files:
-        data = f.getvalue()
-        prev = ss.reports.get(f.name, {})
-        ss.reports[f.name] = {"bytes": data, "file_name": f.name, "uploaded": datetime.now(),
-                              "sha256": hashlib.sha256(data).hexdigest(),
-                              "scope_settings": prev.get("scope_settings", {}), "last_scope": prev.get("last_scope", [])}
-    if files:
-        _activate_report(files[-1].name)
-        ss._goto = "env"
+    files = ss.get(uploader_key()) or []
+    ss._up_n = ss.get("_up_n", 0) + 1          # fresh uploader next run, so files aren't added twice
+    if not files:
+        return
+    incoming = [(f.name, f.getvalue()) for f in files]
+    target = ss.get("active") if ss.get("upload_mode") != "Start a new project" else None
+    if target and target in ss.reports:
+        entry = ss.reports[target]
+        have = {x.get("sha256") for x in entry_sources(entry)}
+        new = []
+        for name, data in incoming:
+            sha = hashlib.sha256(data).hexdigest()
+            if sha in have:
+                continue
+            have.add(sha)
+            new.append(new_source(name, data=data, sha=sha))
+        if not new:
+            flash("error", "Those files are already in this project.")
+            return
+        change_sources(target, entry, lambda e: e["sources"].extend(new))
+        flash("success", f"Added {len(new)} source{'s' if len(new) != 1 else ''} to {target}. Add more, or go to "
+                         "Current Environment to start sizing.")
+        ss._scope_for = None
+        return
+    seen, srcs = set(), []
+    for name, data in incoming:
+        sha = hashlib.sha256(data).hexdigest()
+        if sha not in seen:
+            seen.add(sha)
+            srcs.append(new_source(name, data=data, sha=sha))
+    key = srcs[0]["file_name"] if len(srcs) == 1 else f"{srcs[0]['file_name']} + {len(srcs) - 1} more"
+    base, n = key, 2
+    while key in ss.reports:
+        key, n = f"{base} ({n})", n + 1
+    ss.reports[key] = {"sources": srcs, "file_name": srcs[0]["file_name"], "uploaded": datetime.now(),
+                       "scope_settings": {}, "last_scope": []}
+    entry_sources(ss.reports[key])
+    _activate_report(key)
+    ss.upload_mode = "Add to active project"      # further uploads join this project
+    flash("success", f"Started a project with {len(srcs)} source{'s' if len(srcs) != 1 else ''}. Add more files, "
+                     "or go to Current Environment to start sizing.")
+
+
+def _rename_source(entry_name, uid):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    new = " ".join(str(ss.get(f"alias_{uid}") or "").split())
+    others = {x["alias"] for x in entry_sources(entry) if x["uid"] != uid}
+    src = next(x for x in entry["sources"] if x["uid"] == uid)
+    if not new or new in others or SRC_SEP.strip() in new:
+        flash("error", "Source names must be unique, not empty, and can't contain '·'.")
+        ss[f"alias_{uid}"] = src["alias"]
+        return
+    change_sources(entry_name, entry, lambda e: src.update(alias=new))
+
+
+def _toggle_source(entry_name, uid):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    src = next(x for x in entry["sources"] if x["uid"] == uid)
+    src["enabled"] = bool(ss.get(f"inc_{uid}"))
+    entry.pop("_bundle", None)
+    ss._scope_for = None
+
+
+def _remove_source(entry_name, uid):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    change_sources(entry_name, entry, lambda e: e.update(sources=[x for x in e["sources"] if x["uid"] != uid]))
+
+
+def render_project_sources():
+    """Sources card for the active project: rename, include/exclude, remove, overlap warnings."""
+    ss = st.session_state
+    name = ss.get("active")
+    if not name or name not in ss.reports:
+        return
+    entry = ss.reports[name]
+    try:
+        srcs = entry_sources(entry)
+    except Exception:  # noqa: BLE001
+        return
+    section_title("Active project", f"Sources in {entry.get('project_name') or name}")
+    st.caption("Every cluster from these files is listed under Cluster scope on the sizing pages. With two or more "
+               "files, clusters are named \"source · cluster\"; rename a source below. Upload more files above to add them, "
+               "then click Configure clusters. Save project keeps the whole collection.")
+    with st.container(border=True):
+        for src in srcs:
+            uid = src["uid"]
+            if f"alias_{uid}" not in ss:
+                ss[f"alias_{uid}"] = src["alias"]
+            if f"inc_{uid}" not in ss:
+                ss[f"inc_{uid}"] = src.get("enabled", True)
+            try:
+                stype, n_cl, n_h, n_vm = source_facts(src)
+            except Exception:  # noqa: BLE001
+                stype, n_cl, n_h, n_vm = None, 0, 0, 0
+            c1, c2, c3, c4 = st.columns([2.2, 3, 1.3, 1], vertical_alignment="center")
+            c1.text_input("Source name", key=f"alias_{uid}", on_change=_rename_source, args=(name, uid),
+                          label_visibility="collapsed")
+            c2.markdown(f":{'blue' if stype else 'red'}-badge[{stype or 'Not recognised'}] "
+                        f":gray[{escape(src['file_name'])} · {n_cl} clusters · {n_h:,} hosts · {n_vm:,} VMs]")
+            c3.toggle("Include", key=f"inc_{uid}", on_change=_toggle_source, args=(name, uid),
+                      help="Excluded sources are kept in the project but left out of every sizing and report.")
+            c4.button("Remove", key=f"rmsrc_{uid}", icon=":material/delete:", disabled=len(srcs) < 2,
+                      on_click=_remove_source, args=(name, uid), width="stretch")
+    if st.button("Configure clusters", type="primary", icon=":material/arrow_forward:", key="go_env"):
+        st.switch_page(PAGES["env"])
+    for a, b, v, h in source_overlaps(entry):
+        what = " and ".join(x for x in (f"{v:,} VMs" if v else "", f"{h:,} hosts" if h else "") if x)
+        st.markdown(f":orange-badge[:material/warning: Possible overlap] **{a}** and **{b}** share {what}. They may "
+                    "describe the same environment; exclude one to avoid counting it twice.")
 
 
 def _open_report(name):
@@ -2012,13 +2778,23 @@ def page_home():
     page_header(greeting(), f"{n} report{'s' if n != 1 else ''} loaded this session" if n
                 else "Upload an RVTools or Live Optics export to start a sizing.")
     with st.container(border=True):
-        st.markdown("#### Upload a report")
-        st.caption("RVTools (.xlsx with a vInfo tab) or Dell Live Optics (.xlsx with VMs and ESX Hosts tabs). "
-                   "Files stay on this computer.")
+        active = st.session_state.get("active")
+        has_active = bool(active and active in st.session_state.reports)
+        st.markdown("#### Add source files")
+        st.caption("RVTools (.xlsx with a vInfo tab) or Dell Live Optics (.xlsx with VMs and ESX Hosts tabs). Add as many "
+                   "as you need: all their clusters appear together under Cluster scope. Files stay on this computer.")
+        if has_active:
+            if st.session_state.get("upload_mode") not in ("Add to active project", "Start a new project"):
+                st.session_state.upload_mode = "Add to active project"
+            st.segmented_control("Uploads go to", ["Add to active project", "Start a new project"], key="upload_mode",
+                                 width=seg_width(["Add to active project", "Start a new project"]),
+                                 help=f"'Add to active project' adds files as extra sources to '{active}'. "
+                                      "'Start a new project' puts the next upload in a separate project.")
         st.file_uploader("Upload RVTools or Live Optics Excel file(s)", type=["xlsx"], accept_multiple_files=True,
-                         key="uploader", on_change=_ingest_uploads, label_visibility="collapsed")
+                         key=uploader_key(), on_change=_ingest_uploads, label_visibility="collapsed")
 
     if n:
+        render_project_sources()
         render_session_reports()
     render_saved_projects()
 
@@ -2116,7 +2892,7 @@ def render_parameters(ctx):
             c[3].number_input("CPU speed (GHz)", 1.0, 5.0, key="clock", help="Used for Live Optics performance sizing")
             st.segmented_control(
                 "Live Optics basis", ["95th Percentile", "Peak CPU", "Average CPU"], key="lo_basis", width=seg_width(["95th Percentile", "Peak CPU", "Average CPU"]),
-                disabled=ctx["source"] != "LiveOptics",
+                disabled="LiveOptics" not in ctx["source"],
                 help=f"GHz demand used for performance sizing. '95th' is estimated as {LO_95TH_FALLBACK:.0%} "
                      "of Peak if the column is missing. Live Optics files only.")
             s = st.session_state
@@ -2176,6 +2952,12 @@ def page_recommendation():
     r = ctx["r"]
     page_header("Recommendation", context_subtitle(ctx), ctx)
     scope_bar(ctx)
+    if ctx.get("out_of_scope"):
+        with st.container(border=True):
+            st.markdown("#### This cluster is out of scope")
+            st.caption("It isn't sized and won't appear in any report. Turn **Active** on above (or on Current "
+                       "Environment) to configure it.")
+        return
     render_parameters(ctx)
 
     section_title("The short answer", "Sizing recommendation")
@@ -2307,11 +3089,32 @@ def page_report():
                       on_click=lambda: st.session_state.update(cust_logo=None))
         else:
             st.caption("No logo uploaded. The customer name is shown instead.")
+    bundle = ctx.get("bundle") or {}
+    items = bundle.get("items") or []
+    if items:
+        with st.container(border=True):
+            st.markdown("#### What's in the consolidated report")
+            st.caption("A Summary tab with totals, a cluster comparison, licensing and storage roll-up and risks, "
+                       "then one tab per sized cluster. Consolidation scenarios get their own tab but aren't added to the totals.")
+            st.markdown(" ".join(
+                f":{'blue' if it['kind'] == 'cluster' else 'violet'}-badge[{it['label']}"
+                f"{' · scenario' if it['kind'] == 'scenario' else ''}]" for it in items))
+            sized = {c for it in items if it["kind"] == "cluster" for c in [it["label"]]}
+            missing = [c for c in ctx["clusters"] if c not in sized]
+            if missing and len(ctx["clusters"]) > 1:
+                st.caption(f":material/info: Not sized yet, so not included: {', '.join(missing)}. "
+                           "Select a cluster on Recommendation to add it.")
     section_title("Preview", "What the customer will see")
+    view = "This selection"
+    if bundle.get("html"):
+        view = st.segmented_control("Preview", ["Consolidated", "This selection"], key="preview_view",
+                                    width=seg_width(["Consolidated", "This selection"]),
+                                    label_visibility="collapsed") or "Consolidated"
+    preview = bundle["html"] if view == "Consolidated" and bundle.get("html") else ctx["html"]
     if hasattr(st, "iframe"):
-        st.iframe(ctx["html"], height=1400)
+        st.iframe(preview, height=1400)
     else:
-        components.html(ctx["html"], height=1400, scrolling=True)
+        components.html(preview, height=1400, scrolling=True)
 
 
 def page_raw():
@@ -2328,7 +3131,8 @@ def page_raw():
 
     df = ctx["inv"]["raw_vms"] if view == "VMs" else ctx["inv"]["raw_hosts"]
     if cols_mode == "Key columns":
-        keep = [c for c in KEY_COLUMNS[ctx["source"]][view] if c in df.columns]
+        wanted = (["Source"] + [c for t in ("RVTools", "LiveOptics") if t in ctx["source"] for c in KEY_COLUMNS[t][view]])
+        keep = [c for c in dict.fromkeys(wanted) if c in df.columns]
         if keep:
             df = df[keep]
     if query:
