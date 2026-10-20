@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.10)
+# 📊 Virtualization Sizing Calculator (v3.11)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.10
+**Version:** 3.11
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -108,9 +108,16 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Constraints:** CPU/RAM overhead, minimum cluster size (default 2), HA tolerance.
 * **Host Count Override:** Force a static host count instead of the calculated sizing; shortfalls are flagged.
 * **Live Optics Basis:** Peak, Average, or 95th Percentile.
-* **Scope:** One, several (consolidation), or all clusters; include/exclude powered-off VMs.
+* **Scope:** One, several (consolidation), or all clusters; size all VMs, powered-on only, or powered-off only (DR).
 
 ## 📝 Changelog
+
+**3.11**
+* The app version is shown under the Host Sizer logo in the sidebar.
+* **Remove a sizing.** Next to the *Configured* list under Cluster scope, **Manage** lists every saved cluster selection with an **x** to remove it (for example a multi-cluster combination changed by accident). Removed sizings drop out of the reports; selecting the same clusters again starts fresh.
+* **Sizing method in every report.** A short *Sizing Method* section explains, in plain language, how the sizing was done (data, scope, usable host, host count, checks, room to grow) and lists the settings used for each cluster. It appears on the Summary tab of the consolidated report and at the end of each single report.
+* **VMs to size: All VMs, Powered on only, or Powered off only.** The new three-way choice (Sizing parameters → Scope & growth) replaces the powered-off toggle. *Powered off only* sizes a DR environment; suspended VMs count as powered off, and Live Optics performance sizing is hidden in that mode. Existing projects keep their previous choice.
+* **Room to grow.** Each sizing shows the average VM (vCPU and RAM) and how many more average VMs fit on the Day 1 and future clusters, with the HA hosts failed and the design limit, before another host is needed, plus how many each extra host adds. It's on the Recommendation page, in each report, and as a per-cluster table on the consolidated Summary. Storage isn't included yet.
 
 **3.10**
 * **Consolidated report.** *Download consolidated report* (the default) creates one HTML file, `<customer>-Consolidated-AHEAD Sizing.html`, with a **Summary** tab and a tab for every sized cluster. The Summary shows totals for current vs. Day 1 vs. future, a cluster comparison table (click a name to open its tab), a licensing and storage roll-up, and a list of risks and flags by cluster. Print / Save PDF prints every tab.

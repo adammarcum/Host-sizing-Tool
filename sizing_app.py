@@ -33,7 +33,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.10"
+APP_VERSION = "3.11"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -198,6 +198,141 @@ def cluster_list(source, sheets):
     return sorted(df["Cluster"].dropna().astype(str).unique())
 
 
+# ---------- 3.11: power scope, headroom, method section ----------
+POWER_ALL, POWER_ON, POWER_OFF = "All VMs", "Powered on only", "Powered off only"
+POWER_MODES = [POWER_ALL, POWER_ON, POWER_OFF]
+
+
+def power_mode(values):
+    """Normalise the VM power-state choice. Older settings stored include_off (True/False)."""
+    v = (values or {}).get("power_scope")
+    if v in POWER_MODES:
+        return v
+    return POWER_ALL if (values or {}).get("include_off", True) else POWER_ON
+
+
+def filter_power(df, col, mode):
+    """Keep all VMs, only powered-on, or only powered-off (suspended counts as off)."""
+    if mode == POWER_ALL or col not in df.columns:
+        return df
+    on = df[col].astype(str).str.contains("poweredOn", case=False, na=False)
+    return df[on] if mode == POWER_ON else df[~on]
+
+
+def vm_headroom(r, hosts, vcpu, ram):
+    """How many more average-sized VMs fit on `hosts` within the design rules (HA hosts failed,
+    vCPU:pCPU design limit, usable RAM after overhead) before another host is needed."""
+    if not r["tot_vms"] or (not r["tot_vcpu"] and not r["tot_ram"]):
+        return None
+    avg_c, avg_m = r["tot_vcpu"] / r["tot_vms"], r["tot_ram"] / r["tot_vms"]
+    active = max(hosts - r["ha_nodes"], 0)
+    room_c = (active * r["eff_cores"] * r["vcpu_ratio"] - vcpu) / avg_c if avg_c else math.inf
+    room_m = (active * r["eff_ram"] - ram) / avg_m if avg_m else math.inf
+    room = min(room_c, room_m)
+    return {"vms": math.floor(room + EPS), "limit": "CPU" if room_c <= room_m else "RAM"}
+
+
+def add_headroom(r):
+    if not r["tot_vms"]:
+        r.update(avg_vm_vcpu=0.0, avg_vm_ram=0.0, headroom_now=None, headroom_fut=None, vms_per_host=None)
+        return
+    avg_c, avg_m = r["tot_vcpu"] / r["tot_vms"], r["tot_ram"] / r["tot_vms"]
+    per_c = r["eff_cores"] * r["vcpu_ratio"] / avg_c if avg_c else math.inf
+    per_m = r["eff_ram"] / avg_m if avg_m else math.inf
+    r.update(avg_vm_vcpu=avg_c, avg_vm_ram=avg_m,
+             headroom_now=vm_headroom(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"]),
+             headroom_fut=vm_headroom(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"]),
+             vms_per_host=math.floor(min(per_c, per_m) + EPS) if min(per_c, per_m) != math.inf else None)
+
+
+def headroom_text(h):
+    if h is None:
+        return "n/a"
+    if h["vms"] < 0:
+        return f"Over by {-h['vms']:,} VMs"
+    return f"{h['vms']:,} more VMs"
+
+
+METHOD_STEPS = [
+    ("Data", "Inventory from RVTools (configured vCPU and memory) and/or Live Optics (which also measures CPU demand). "
+             "It is a point-in-time snapshot."),
+    ("Scope", "Templates and placeholder VMs are excluded. Either all VMs, only powered-on VMs, or only powered-off VMs "
+              "(for DR) are sized. Clusters marked out of scope are left out."),
+    ("Usable host", "Each new host's cores and memory, minus the CPU and memory overhead reserved for the hypervisor."),
+    ("Host count", "Hosts needed for CPU (vCPU ÷ the vCPU:pCPU design limit) and for memory; the larger number wins. "
+                   "HA spare hosts are added, and the cluster never goes below the minimum size. The future figure repeats "
+                   "this with compound annual growth."),
+    ("Checks", "The design is re-tested with the HA hosts failed. vCPU:pCPU ratios above the hypervisor's guidance are "
+               "flagged in red."),
+    ("Room to grow", "How many more VMs of the current average size fit within the same rules before another host is needed."),
+    ("Also shown", "Live Optics performance sizing (80% CPU target), NUMA fit for large VMs, and per-core licensing "
+                   "(16-core minimum per CPU)."),
+]
+METHOD_NOTE = ("This is a planning estimate based on the data provided. Storage, vSAN, GPU and application-specific "
+               "requirements are not included and should be confirmed during design.")
+
+
+def method_section_html(rs, section_class=""):
+    """Short, general explanation of the sizing method plus the settings used for each cluster."""
+    e = lambda v: escape(str(v))  # noqa: E731
+    steps = "".join(f"<li><strong>{e(t)}.</strong> {e(d)}</li>" for t, d in METHOD_STEPS)
+    rows = "".join(
+        f"<tr><td>{e(r['scope_label'])}</td><td>{e(r['hypervisor'])} ({r['hv_ratio']:.1f}:1)</td>"
+        f"<td>{r['vcpu_ratio']:.1f}:1</td><td>{r['cpu_buffer']}% / {r['ram_buffer']}%</td>"
+        f"<td>N+{r['ha_nodes']} · min {r['min_hosts']}</td><td>{r['growth']*100:.0f}% × {r['years']} yrs</td>"
+        f"<td>{e(r.get('power_scope', POWER_ALL))}</td>"
+        f"<td>{e(str(r['override_hosts']) + ' hosts' if r['override_now'] else '—')}</td></tr>" for r in rs)
+    return f"""
+<section class="{section_class}" id="method"><div class="wrap">
+  <div class="eyebrow">How this sizing was done</div>
+  <h2>Sizing Method</h2>
+  <div class="card navy" style="margin-top:28px"><ol class="logic" style="padding-left:18px">{steps}</ol></div>
+  <h3>Settings used</h3>
+  <div class="table-card scroll" style="margin-top:0"><table class="compare">
+    <tr><th>Cluster</th><th>Hypervisor</th><th>Design limit</th><th>Overhead CPU / RAM</th><th>HA</th>
+        <th>Growth</th><th>VMs sized</th><th>Override</th></tr>{rows}</table></div>
+  <div class="note">{e(METHOD_NOTE)}</div>
+</div></section>"""
+
+
+def headroom_view(h, ok_text):
+    """(big number, unit, explanation) for a headroom result."""
+    if h is None:
+        return "n/a", "", ""
+    if h["vms"] >= 0:
+        return f"{h['vms']:,}", "more VMs", f"{ok_text} {h['limit']} runs out first."
+    return f"{-h['vms']:,}", "VMs short", "Already short of the design rules at this host count."
+
+
+def headroom_cards_html(r):
+    """'Room to grow' cards for a single-cluster report."""
+    e = lambda v: escape(str(v))  # noqa: E731
+    if r["headroom_now"] is None:
+        return ""
+    over = r["vcpu_ratio"] > r["hv_ratio"] + EPS
+    note = (f" <span class='over'>The design limit ({r['vcpu_ratio']:.1f}:1) is above the {e(hv_label(r))}, "
+            "so this headroom assumes a denser cluster than the guidance.</span>" if over else "")
+
+    def card(cls, label, big, unit, sub):
+        return (f"<div class='card {cls}'><div class='label'>{e(label)}</div><div class='big'>{e(big)} <small>{e(unit)}</small>"
+                f"</div><p>{e(sub)}</p></div>")
+    d1 = headroom_view(r["headroom_now"], "Before another host is needed.")
+    fu = headroom_view(r["headroom_fut"], f"After {r['years']} years of {r['growth']*100:.0f}% growth.")
+    cards = [
+        card("navy", "Average VM", f"{r['avg_vm_vcpu']:.1f}", f"vCPU · {r['avg_vm_ram']:,.1f} GB",
+             f"Across {r['tot_vms']:,} VMs in scope today."),
+        card("green" if r["headroom_now"]["vms"] >= 0 else "", f"Day 1 · {r['hosts_now']} hosts", *d1),
+        card("", f"Future · {r['hosts_fut']} hosts", *fu),
+        card("", "Each extra host", f"~{r['vms_per_host']:,}" if r["vms_per_host"] else "n/a", "average VMs",
+             "Room one more host adds at the design limit."),
+    ]
+    return f"""
+  <h3>Room to grow</h3>
+  <p class="foot" style="margin-top:-6px">How many more VMs of today's average size fit, with the HA hosts failed and the
+    {r['vcpu_ratio']:.1f}:1 design limit, before another host is needed.{note}</p>
+  <div class="cards">{''.join(cards)}</div>"""
+
+
 # =============================================================================
 # 3b. PROJECT LIBRARY (saved projects keep ONLY the columns the sizing needs)
 # =============================================================================
@@ -330,12 +465,12 @@ def list_projects(folder=None):
 #   has_perf, perf_ghz, perf_estimated, lic_edition, esxi_version
 #   raw_vms, raw_hosts (original rows in scope, for the Raw Data tab)
 # =============================================================================
-def parse_rvtools(sheets, clusters, include_off):
+def parse_rvtools(sheets, clusters, power=POWER_ALL):
     info = drop_templates(sheets["vInfo"])
     info = filter_clusters(info, clusters)
     vm_on, vm_off = power_counts(info, "Powerstate")
-    if not include_off:
-        info = powered_on_only(info, "Powerstate")
+    power = power if power in POWER_MODES else (POWER_ALL if power else POWER_ON)
+    info = filter_power(info, "Powerstate", power)
 
     if "Memory" in info.columns:            # RVTools 'Memory' is MiB
         ram_gb = num(info["Memory"]) / 1024
@@ -413,17 +548,17 @@ def parse_rvtools(sheets, clusters, include_off):
         "guest_used_tb": guest_used_tb, "rdm_cnt": rdm_cnt, "rdm_tb": rdm_tb,
         "has_perf": False, "perf_ghz": 0.0, "perf_estimated": False,
         "lic_edition": lic_edition, "esxi_version": esxi_version,
-        "vm_on": vm_on, "vm_off": vm_off, "include_off": include_off,
+        "vm_on": vm_on, "vm_off": vm_off, "include_off": power != POWER_ON, "power_scope": power,
         "raw_vms": info, "raw_hosts": vhost,
     }
 
 
-def parse_live_optics(sheets, clusters, include_off, basis):
+def parse_live_optics(sheets, clusters, power, basis):
     vm = drop_templates(sheets["VMs"])
     vm = filter_clusters(vm, clusters)
     vm_on, vm_off = power_counts(vm, "Power State")
-    if not include_off:
-        vm = powered_on_only(vm, "Power State")
+    power = power if power in POWER_MODES else (POWER_ALL if power else POWER_ON)
+    vm = filter_power(vm, "Power State", power)
 
     vms = pd.DataFrame({
         "name": vm["VM Name"].astype(str) if "VM Name" in vm.columns else "N/A",
@@ -473,7 +608,7 @@ def parse_live_optics(sheets, clusters, include_off, basis):
     # Performance
     has_perf, perf_ghz, perf_estimated = False, 0.0, False
     perf = sheets.get("ESX Performance")
-    if perf is not None:
+    if perf is not None and power != POWER_OFF:      # host-level demand can't be split by VM power state
         p = filter_clusters(perf, clusters)
         if basis == "95th Percentile":
             if "95th Percentile CPU (GHz)" in p.columns:
@@ -500,7 +635,7 @@ def parse_live_optics(sheets, clusters, include_off, basis):
         "rdm_cnt": 0, "rdm_tb": 0.0,
         "has_perf": has_perf, "perf_ghz": perf_ghz, "perf_estimated": perf_estimated,
         "lic_edition": lic_edition, "esxi_version": esxi_version,
-        "vm_on": vm_on, "vm_off": vm_off, "include_off": include_off,
+        "vm_on": vm_on, "vm_off": vm_off, "include_off": power != POWER_ON, "power_scope": power,
         "raw_vms": vm, "raw_hosts": esx,
     }
 
@@ -669,6 +804,8 @@ def compute_sizing(inv, p):
     r["checks_fut"] = capacity_checks(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"], r["calc_hosts_fut"])
     r["design_now"] = design_status(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"])
     r["design_fut"] = design_status(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"])
+    r["power_scope"] = power_mode(p)
+    add_headroom(r)
 
     # Performance sizing (Live Optics) - GHz demand, but never below the RAM requirement
     r["perf_hosts_ghz"], r["perf_hosts_rec"], r["perf_constraint"] = 0, 0, ""
@@ -897,10 +1034,12 @@ def current_env(r):
     Returns (headline_metrics, groups) where groups = [(title, [(label, value, is_warning)])]."""
     if r["vm_on"] is None:
         vm_line = f"{r['tot_vms']:,}"
-    elif r["include_off"]:
-        vm_line = f"{r['tot_vms']:,} ({r['vm_on']:,} on / {r['vm_off']:,} off)"
-    else:
+    elif r.get("power_scope", POWER_ALL) == POWER_OFF:
+        vm_line = f"{r['tot_vms']:,} powered off for DR ({r['vm_on']:,} powered-on excluded)"
+    elif r.get("power_scope", POWER_ALL) == POWER_ON or not r.get("include_off", True):
         vm_line = f"{r['tot_vms']:,} powered on ({r['vm_off']:,} powered-off excluded)"
+    else:
+        vm_line = f"{r['tot_vms']:,} ({r['vm_on']:,} on / {r['vm_off']:,} off)"
 
     mem_alloc_warn = r["cur_mem_alloc"] is not None and r["cur_mem_alloc"] > 1
     headline = [
@@ -1207,7 +1346,7 @@ def generate_html_report(r, customer_logo_uri=None):
     <span class="divider"></span>
     <span class="eyebrow muted">Scope</span><div class="chip">{e(r['scope_label'])}</div>
   </div>
-  <div class="eyebrow kicker">{e(r['hypervisor'])} sizing · {e(r['source_type'])} analysis · {now:%b %d, %Y}</div>
+  <div class="eyebrow kicker">{e(r['hypervisor'])} sizing · {e(r['source_type'])} analysis{' · DR (powered-off VMs)' if r.get('power_scope') == POWER_OFF else ''} · {now:%b %d, %Y}</div>
   <h1>{e(r['customer'])} host sizing: <em>today</em> + <em>tomorrow</em></h1>
   <p class="lede">{e(hero_lede)}</p>
   <div class="stats">{stats_html}</div>
@@ -1234,6 +1373,7 @@ def generate_html_report(r, customer_logo_uri=None):
     <div class="pgrid">{panel_html}</div>
   </div>
   <div class="table-card">{compare_html}</div>
+  {headroom_cards_html(r)}
   <h3>How the number was reached</h3>
   <div class="card navy">{logic_html}</div>
 </div></section>
@@ -1266,6 +1406,7 @@ def generate_html_report(r, customer_logo_uri=None):
   </div>
 </div></section>
 {perf_html}
+{method_section_html([r], "alt" if perf_html else "")}
 <footer><div class="wrap">
   {f'<img src="{ahead_white}" alt="AHEAD">' if ahead_white else '<strong>AHEAD</strong>'}
   <span>Confidential - Proprietary to AHEAD · Prepared for {e(r['customer'])}</span>
@@ -1338,6 +1479,7 @@ def report_flags(r):
 def report_body(single_html, prefix):
     """Hero + sections of a single-cluster report, with ids prefixed so tabs don't collide."""
     body = single_html[single_html.index('<header class="hero"'):single_html.index("<footer>")]
+    body = re.sub(r'<section class="[^"]*" id="method">.*?</section>', "", body, flags=re.S)   # shown once on Summary
     return re.sub(r'id="([^"]+)"', lambda m: f'id="{prefix}-{m.group(1)}"', body)
 
 
@@ -1433,6 +1575,21 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
                    "<div class='note'><strong>All clear.</strong> No shortfalls, ratios above guidance or wide VMs.</div>")
                   + (f"<div class='note'><strong>No issues:</strong> {e(', '.join(clean))}.</div>" if clean and flag_cards else ""))
 
+    def grow_cell(h):
+        if h is None:
+            return "n/a"
+        return f"{h['vms']:,} ({h['limit']})" if h["vms"] >= 0 else f"<span class='over'>{-h['vms']:,} short</span>"
+    grow_rows = "".join(
+        f"<tr><td>{go(it)}</td><td>{it['r']['avg_vm_vcpu']:.1f} vCPU · {it['r']['avg_vm_ram']:,.1f} GB</td>"
+        f"<td class='hl'>{grow_cell(it['r']['headroom_now'])}</td><td>{grow_cell(it['r']['headroom_fut'])}</td>"
+        f"<td>{'~' + format(it['r']['vms_per_host'], ',') if it['r']['vms_per_host'] else 'n/a'}</td></tr>" for it in clusters)
+    d1_tot = sum(max(c["r"]["headroom_now"]["vms"], 0) for c in clusters if c["r"]["headroom_now"])
+    fu_tot = sum(max(c["r"]["headroom_fut"]["vms"], 0) for c in clusters if c["r"]["headroom_fut"])
+    grow_html = ("<table class='compare'><tr><th>Cluster</th><th>Average VM</th><th>Day 1 room (limit)</th>"
+                 "<th>Future room (limit)</th><th>Each extra host</th></tr>" + grow_rows
+                 + f"<tr class='total'><td>Total</td><td>{(vcpu / vms if vms else 0):.1f} vCPU · {(vram / vms if vms else 0):,.1f} GB</td>"
+                 f"<td class='hl'>{d1_tot:,} VMs</td><td>{fu_tot:,} VMs</td><td></td></tr></table>")
+
     summary = f"""
 <header class="hero"><div class="wrap">
   <div class="prepared"><span class="eyebrow muted">Prepared for</span>{prepared}
@@ -1477,7 +1634,14 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
   <p class="section-lede">{plural(n_flags, 'item')} across {plural(len(flagged), 'cluster')}: design-check shortfalls, ratios above
     hypervisor guidance and VMs wider than a socket.</p>
   {flags_html}
-</div></section>"""
+</div></section>
+<section><div class="wrap">
+  <div class="eyebrow">Capacity planning</div><h2>Room to grow</h2>
+  <p class="section-lede">How many more VMs of each cluster's average size fit, with the HA hosts failed and the design limit,
+    before another host is needed.</p>
+  <div class="table-card scroll">{grow_html}</div>
+</div></section>
+{method_section_html([c["r"] for c in items], "alt")}"""
 
     panels = [f'<div class="tabpanel" id="summary" role="tabpanel">{summary}</div>']
     tabs = ['<button class="tab" data-tab="summary" role="tab">Summary</button>']
@@ -1563,6 +1727,7 @@ APP_CSS = """<style>
 .hs-update a.dl { background: #00B388; color: #FFFFFF; padding: 6px 14px; margin-right: 8px; }
 .hs-update a.nt { color: #67C3E9; }
 .hs-update .mac { margin-top: 8px; font-size: 11.5px; color: rgba(255,255,255,.7); }
+.hs-brand .ver { margin-top: 8px; font-size: 11.5px; letter-spacing: .04em; color: #8C9BAB; }
 .hs-brand img.lockup { width: 100%; max-width: 230px; height: auto; display: block; }
 .hs-brand .name { font-size: 30px; font-weight: 700; color: #FFFFFF; line-height: 1.05; letter-spacing: -.01em; }
 .hs-brand .pb { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.8); }
@@ -1595,13 +1760,13 @@ DEFAULTS = {
     "sockets": 2, "cores": 24, "ram": 1024, "clock": 2.5, "lo_basis": "95th Percentile",
     "hypervisor": DEFAULT_HYPERVISOR, "vcpu_ratio": HYPERVISORS[DEFAULT_HYPERVISOR][0], "cpu_buffer": 10, "ram_buffer": 10, "min_hosts": 2, "ha_nodes": 1,
     "override": False, "override_hosts": 4, "override_future": True,
-    "include_off": True, "growth_pct": 10.0, "years": 3,
+    "include_off": True, "power_scope": POWER_ALL, "growth_pct": 10.0, "years": 3,
     "customer": "My Customer", "scope": [],
     "cmp_view": "Both", "preview_view": "Consolidated", "upload_mode": "Add to active project", "raw_view": "VMs", "raw_cols": "Key columns", "raw_search": "",
 }
 PARAM_KEYS = ["hypervisor", "sockets", "cores", "ram", "clock", "lo_basis", "vcpu_ratio", "cpu_buffer", "ram_buffer",
               "min_hosts", "ha_nodes", "override", "override_hosts", "override_future",
-              "include_off", "years", "customer"]
+              "include_off", "power_scope", "years", "customer"]
 
 KEY_COLUMNS = {
     "RVTools": {"VMs": ["VM", "Powerstate", "Cluster", "Host", "CPUs", "Memory", "Provisioned MiB", "In Use MiB",
@@ -1687,6 +1852,8 @@ def params_from_state():
     p["growth"] = ss["growth_pct"] / 100
     p["lo_basis"] = ss["lo_basis"] or DEFAULTS["lo_basis"]   # segmented control can be deselected
     p["hypervisor"] = ss["hypervisor"] or DEFAULT_HYPERVISOR
+    p["power_scope"] = power_mode(p)
+    p["include_off"] = p["power_scope"] != POWER_ON
     return p
 
 
@@ -1852,8 +2019,8 @@ def parse_entry(entry, scope, p):
             local = [c for cid, uid, c in ids if uid == src["uid"] and cid in scope]
             if not local:
                 continue
-        inv = (parse_rvtools(sheets, local, p["include_off"]) if stype == "RVTools"
-               else parse_live_optics(sheets, local, p["include_off"], p["lo_basis"]))
+        inv = (parse_rvtools(sheets, local, p["power_scope"]) if stype == "RVTools"
+               else parse_live_optics(sheets, local, p["power_scope"], p["lo_basis"]))
         parts.append((src, stype, inv))
     if not parts:
         raise ValueError("None of the enabled sources has data for this selection.")
@@ -1895,7 +2062,7 @@ def merge_inventories(parts):
         "perf_estimated": any(i["perf_estimated"] for i in invs),
         "lic_edition": joined("lic_edition"), "esxi_version": joined("esxi_version"),
         "vm_on": sum(on) if on else None, "vm_off": sum(off) if off else None,
-        "include_off": invs[0].get("include_off", True),
+        "include_off": invs[0].get("include_off", True), "power_scope": invs[0].get("power_scope", POWER_ALL),
         "raw_vms": cat("raw_vms", tag=True), "raw_hosts": cat("raw_hosts", tag=True),
     }
 
@@ -1997,6 +2164,8 @@ def scope_params(values):
     ss = st.session_state
     p = {k: DEFAULTS[k] for k in SIZING_KEYS}
     p.update({k: v for k, v in (values or {}).items() if k in SIZING_KEYS})
+    p["power_scope"] = power_mode(values or {})
+    p["include_off"] = p["power_scope"] != POWER_ON
     p["lo_basis"] = p["lo_basis"] or DEFAULTS["lo_basis"]
     p["hypervisor"] = p["hypervisor"] or DEFAULT_HYPERVISOR
     p["growth"] = p["growth_pct"] / 100
@@ -2176,8 +2345,10 @@ def page_header(title, subtitle="", ctx=None):
                       f":gray-badge[:material/hub: {r['scope_label']}]"]
             if r["override_now"]:
                 badges.append(":orange-badge[:material/lock: Host count override]")
-            if not r["include_off"]:
-                badges.append(":gray-badge[Powered-off VMs excluded]")
+            if r.get("power_scope") == POWER_ON:
+                badges.append(":gray-badge[Powered-on VMs only]")
+            elif r.get("power_scope") == POWER_OFF:
+                badges.append(":orange-badge[:material/shield: Powered-off VMs only (DR)]")
             badges.append(save_status(st.session_state.reports[ctx["key"]]))
             st.markdown(" ".join(badges))
     with right:
@@ -2252,8 +2423,36 @@ def scope_bar(ctx):
     current = scope_key(st.session_state.scope)
     if len(ctx["clusters"]) > 1:
         tags = " ".join(f":{'blue' if k == current else 'gray'}-badge[{k}]" for k in sorted(store))
-        st.caption(":material/tune: Sizing settings are kept separately for each cluster selection. "
+        c1, c2 = st.columns([6, 1], vertical_alignment="center")
+        c1.caption(":material/tune: Sizing settings are kept separately for each cluster selection. "
                    f"Configured: {tags}")
+        with c2.popover("Manage", icon=":material/delete_sweep:", width="stretch",
+                        help="Remove sizings you don't need, e.g. a combination of clusters changed by accident."):
+            st.caption("Remove a sizing to delete its settings and drop it from the reports. Selecting the same "
+                       "clusters again starts a fresh sizing.")
+            for k in sorted(store):
+                a, b = st.columns([5, 1], vertical_alignment="center")
+                a.markdown(f":{'blue' if k == current else 'gray'}-badge[{k}]"
+                           + (" :gray[(on screen)]" if k == current else ""))
+                b.button("", key=f"rmsz_{k}", icon=":material/close:", help=f"Remove the {k} sizing",
+                         on_click=_remove_sizing, args=(ctx["key"], k))
+
+
+def _remove_sizing(entry_name, key):
+    """Delete one configured selection's settings. If it's the one on screen, move to another sizing."""
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    entry.get("scope_settings", {}).pop(key, None)
+    entry.get("scope_lists", {}).pop(key, None)
+    entry["touched"] = [t for t in entry.get("touched", []) if t != key]
+    entry.pop("_bundle", None)
+    if scope_key(ss.get("scope", [])) == key:
+        remaining = list(entry.get("scope_settings", {}))
+        nxt = next((k for k in remaining if k != ALL_CLUSTERS), remaining[0] if remaining else None)
+        lists = entry.get("scope_lists", {})
+        ss.scope = list(lists.get(nxt) or ([] if nxt in (None, ALL_CLUSTERS) else nxt.split(" + ")))
+        ss._scope_for = None
+    flash("success", f"Removed the {key} sizing.")
 
 
 def _set_cluster_active(entry_name, cid):
@@ -2308,6 +2507,8 @@ def load_sizing(values):
     for k, v in (values or {}).items():
         if k in SIZING_KEYS:
             st.session_state[k] = v
+    if values:
+        st.session_state["power_scope"] = power_mode(values)
 
 
 def sync_scope_settings(entry_name, entry):
@@ -2609,11 +2810,12 @@ def render_sidebar():
     product_logo = file_data_uri(PRODUCT_LOGO_PATH)
     if product_logo:
         sb.html(f"<div class='hs-brand'><img class='lockup' src='{product_logo}' "
-                f"alt='{escape(PRODUCT_NAME)} - Powered by AHEAD'></div>")
+                f"alt='{escape(PRODUCT_NAME)} - Powered by AHEAD'><div class='ver'>Version {escape(APP_VERSION)}</div></div>")
     else:  # fallback if the logo file is missing
         logo = file_data_uri(WHITE_LOGO_PATH)
         pb = f"Powered by <img src='{logo}' alt='AHEAD'>" if logo else "Powered by AHEAD"
-        sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div></div>")
+        sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div>"
+                f"<div class='ver'>Version {escape(APP_VERSION)}</div></div>")
 
     render_update_notice(sb)
     has_report = CTX is not None and not CTX.get("error")
@@ -2918,7 +3120,10 @@ def render_parameters(ctx):
             c = st.columns(3)
             c[0].number_input("Annual growth (%)", 0.0, 100.0, key="growth_pct")
             c[1].number_input("Years", 1, 10, key="years")
-            c[2].toggle("Include powered-off VMs", key="include_off")
+            st.segmented_control("VMs to size", POWER_MODES, key="power_scope", width=seg_width(POWER_MODES),
+                                 help="All VMs, only powered-on VMs, or only powered-off VMs (use this to size a DR "
+                                      "environment). Suspended VMs count as powered off. Live Optics performance "
+                                      "sizing isn't available for powered-off only.")
 
 
 def host_card(r, which):
@@ -2986,6 +3191,23 @@ def page_recommendation():
             eyebrow(label)
             big_value(val, unit, sub)
             st.markdown(badge)
+
+    if r["headroom_now"] is not None:
+        section_title("Capacity planning", "Room to grow")
+        st.caption(f"How many more VMs of today's average size fit, with the HA hosts failed and the "
+                   f"{r['vcpu_ratio']:.1f}:1 design limit, before another host is needed.")
+        g = st.columns(4)
+        g[0].metric("Average VM", f"{r['avg_vm_vcpu']:.1f} vCPU · {r['avg_vm_ram']:,.0f} GB", border=True,
+                    help=f"Across {r['tot_vms']:,} VMs in scope today.")
+        for col, (label, h, hosts) in zip(g[1:3], (("Day 1 room", r["headroom_now"], r["hosts_now"]),
+                                                   ("Future room", r["headroom_fut"], r["hosts_fut"]))):
+            big, unit, sub = headroom_view(h, "")
+            col.metric(f"{label} · {hosts} hosts", f"{big} {unit}".strip(), border=True, help=sub.strip() or None)
+        g[3].metric("Each extra host", f"~{r['vms_per_host']:,} VMs" if r["vms_per_host"] else "n/a", border=True,
+                    help="Room one more host adds at the design limit.")
+        if r["vcpu_ratio"] > r["hv_ratio"] + EPS:
+            st.caption(f":red[The design limit ({r['vcpu_ratio']:.1f}:1) is above the {hv_label(r)}, so this headroom "
+                       "assumes a denser cluster than the guidance.]")
 
     section_title("Side by side", "Current vs. " + ("proposed" if r["override_now"] else "recommended"))
     day1_col = "Proposed (Day 1)" if r["override_now"] else "Recommended (Day 1)"
