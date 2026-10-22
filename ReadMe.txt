@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.11)
+# 📊 Virtualization Sizing Calculator (v3.12)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.11
+**Version:** 3.12
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -38,6 +38,7 @@ A unified infrastructure sizing tool designed for Solutions Architects. It inges
 
 | What you see | What to do |
 |---|---|
+| Windows: *"Could not open requirements file"* or *"files were not found next to this launcher"* | The launcher was run from inside the ZIP (Windows only extracts the one file you double-click). Right-click the ZIP → **Extract All...**, then run `Run_on_windows.bat` from the extracted folder. |
 | *"The libraries could not be downloaded"* | You need internet for the first run. Connect (and join VPN if required) and try again. A proxy may be blocking `pypi.org` / `files.pythonhosted.org` - ask your eTech team to allow them. |
 | Mac: *"Apple could not verify ... is free of malware"* / *"Not Opened"* | Use the one-command install in step 2 (no prompts). Or: **System Settings → Privacy & Security → Open Anyway**. |
 | Mac: *"Run_on_mac.command was not found next to this app"* | macOS is running the downloaded app from a temporary copy. The app has already copied the install command to your clipboard: open Terminal, press Cmd+V, then Return. |
@@ -103,7 +104,7 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 
 ## 🛠 Configuration Options (Recommendation page → Sizing parameters)
 
-* **Target Hardware:** Sockets, cores per socket, RAM per host, CPU GHz.
+* **Target Hardware:** Processor (optional), sockets, cores per socket, RAM per host (pick a common size or type your own), CPU GHz (base clock).
 * **Hypervisor:** Target platform. Sets the Max vCPU:pCPU design limit to its guidance (adjustable) and drives the red ratio flags.
 * **Constraints:** CPU/RAM overhead, minimum cluster size (default 2), HA tolerance.
 * **Host Count Override:** Force a static host count instead of the calculated sizing; shortfalls are flagged.
@@ -111,6 +112,15 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; size all VMs, powered-on only, or powered-off only (DR).
 
 ## 📝 Changelog
+
+**3.12**
+* Launchers check that the tool files are next to them and explain how to fix it (usually: extract the ZIP first) instead of failing with *"Could not open requirements file"*.
+* **Combine RVTools with Live Optics.** When a project has both, Home shows a pairing table: for each RVTools cluster, choose the Live Optics capture of the same cluster. Paired clusters take VMs, vCPU and RAM from RVTools and measured CPU (GHz) from Live Optics, and the Live Optics cluster isn't counted separately. Each pair shows a confidence (*High*, *Possible*, *Low*, or *Conflict*) from host, core, RAM and VM counts and shared VM/host names. *Conflict* flags clusters whose (often anonymised) names match but whose sizes don't. **Fill in suggestions** pre-selects likely matches; nothing is paired until you click **Save pairs**. Pairs are saved with the project and noted in the reports.
+* **Workload labels.** Select a cluster to give it a label (e.g. SQL Server, Citrix, DMZ). A suggestion from the cluster or VM names is offered for you to accept or ignore. Labels appear in the page header, the report heading and the consolidated cluster comparison, and are saved with the project.
+* **Measured CPU (GHz) sizing.** With Live Optics data, hosts are now sized three ways: CPU by vCPU ratio, CPU by measured GHz (the chosen basis at an 80% target, after overhead), and RAM. The largest wins and the binding one is named. GHz is also checked in the Day 1 design check (with the HA hosts failed) and is a third limit in Room to grow.
+* **Processor picker.** Target hardware has a **Processor** list of current and previous-generation server CPUs (Intel Xeon 6 and 5th Gen Xeon Scalable; AMD EPYC 9005 Turin and 9004 Genoa), grouped by generation and sorted by core count. Type to search (e.g. *6737P*). Picking one fills Cores / socket and the base clock (GHz); 1-socket-only parts set Sockets to 1. Editing cores or GHz by hand switches back to *Custom*. The processor name appears in the reports and is saved per cluster selection with the project. This replaces the Hardware options comparison and catalog.
+* **RAM per host dropdown.** Choose a common configuration (256, 512, 768, 1,024, 1,536, 2,048, 3,072 or 4,096 GB), or type another amount (64-8,192 GB, e.g. *1280* or *1,280 GB*) and press Enter. Amounts that aren't a multiple of 256 GB get a warning to check the DIMM layout.
+* The version number now appears only under **About** in the sidebar (no longer under the logo), and the *Update available* notice shows there too.
 
 **3.11**
 * The app version is shown under the Host Sizer logo in the sidebar.
@@ -134,7 +144,7 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * Install instructions updated for macOS 15 (Sequoia), where right-click → Open no longer bypasses the security prompt.
 
 **3.8**
-* **Update notice.** When a newer version is published on GitHub, the sidebar shows an *Update available* card with a **Download update** button and a link to what's new (plus a one-time pop-up). The check reads only the version number from GitHub, at most every 6 hours, and is skipped silently when offline. Set `HOSTSIZER_NO_UPDATE_CHECK=1` to turn it off.
+* **Update notice.** When a newer version is published on GitHub, an *Update available* card appears under **About** in the sidebar with a **Download update** button and a link to what's new (plus a one-time pop-up). The check reads only the version number from GitHub, at most every 6 hours, and is skipped silently when offline. Set `HOSTSIZER_NO_UPDATE_CHECK=1` to turn it off.
 
 **3.7**
 * Downloaded reports are named `<customer>-<cluster>-AHEAD Sizing.html` (e.g. `Acme Corp-Prod-AHEAD Sizing.html`; consolidations read `Acme Corp-C1 + C2-AHEAD Sizing.html`, the full environment `Acme Corp-All Clusters-AHEAD Sizing.html`).

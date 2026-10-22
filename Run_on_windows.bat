@@ -14,6 +14,12 @@ echo ===========================================
 echo.
 
 REM --------------------------------------------------------------------------
+REM 0. The tool files must sit next to this launcher (not run from inside the ZIP)
+REM --------------------------------------------------------------------------
+if not exist "sizing_app.py" goto :missing_files
+if not exist "requirements.txt" goto :missing_files
+
+REM --------------------------------------------------------------------------
 REM 1. Python 3.9+  (ignores the Microsoft Store "python" placeholder)
 REM --------------------------------------------------------------------------
 echo [1/4] Checking for Python...
@@ -108,6 +114,24 @@ echo       Opening python.org. Install Python 3.12 or newer and tick "Add python
 echo       then double-click this launcher again.
 start "" "https://www.python.org/downloads/windows/"
 exit /b 0
+
+:missing_files
+echo The Host Sizer files were not found next to this launcher:
+echo   %CD%
+echo.
+echo %CD% | find /i "\Temp\" >nul
+if not errorlevel 1 (
+    echo It looks like the launcher was opened from inside the ZIP file. Windows only extracts the
+    echo one file you double-click, so the rest of the tool is missing.
+    echo.
+)
+echo To fix it:
+echo   1. Close this window.
+echo   2. Right-click the downloaded ZIP and choose "Extract All...", e.g. to Documents.
+echo   3. Open the extracted folder and double-click Run_on_windows.bat there.
+echo      Keep all the files together: sizing_app.py, requirements.txt, the logos and the launchers.
+pause
+exit /b 1
 
 :no_python
 echo.

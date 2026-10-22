@@ -24,6 +24,16 @@ py_ok() {    # true when $1 is a working Python 3.9 or newer
     "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
 }
 
+# The tool files must sit next to this launcher
+if [ ! -f sizing_app.py ] || [ ! -f requirements.txt ]; then
+    echo "The Host Sizer files were not found next to this launcher:"
+    echo "  $(pwd)"
+    echo ""
+    echo "Unzip the whole download into one folder and run the launcher from there,"
+    echo "or use the one-command install in the ReadMe (no ZIP needed)."
+    finish 1
+fi
+
 # -----------------------------------------------------------------------------
 # 1. Python 3.9+ (prefer a newer python.org / Homebrew install, else Apple's)
 # -----------------------------------------------------------------------------

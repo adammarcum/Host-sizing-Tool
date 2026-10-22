@@ -33,7 +33,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.11"
+APP_VERSION = "3.12"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -219,30 +219,36 @@ def filter_power(df, col, mode):
     return df[on] if mode == POWER_ON else df[~on]
 
 
-def vm_headroom(r, hosts, vcpu, ram):
+def vm_headroom(r, hosts, vcpu, ram, ghz=0.0):
     """How many more average-sized VMs fit on `hosts` within the design rules (HA hosts failed,
     vCPU:pCPU design limit, usable RAM after overhead) before another host is needed."""
     if not r["tot_vms"] or (not r["tot_vcpu"] and not r["tot_ram"]):
         return None
     avg_c, avg_m = r["tot_vcpu"] / r["tot_vms"], r["tot_ram"] / r["tot_vms"]
+    avg_g = r["perf_ghz"] / r["tot_vms"] if r.get("has_perf") else 0.0
     active = max(hosts - r["ha_nodes"], 0)
-    room_c = (active * r["eff_cores"] * r["vcpu_ratio"] - vcpu) / avg_c if avg_c else math.inf
-    room_m = (active * r["eff_ram"] - ram) / avg_m if avg_m else math.inf
-    room = min(room_c, room_m)
-    return {"vms": math.floor(room + EPS), "limit": "CPU" if room_c <= room_m else "RAM"}
+    rooms = {"CPU": (active * r["eff_cores"] * r["vcpu_ratio"] - vcpu) / avg_c if avg_c else math.inf,
+             "RAM": (active * r["eff_ram"] - ram) / avg_m if avg_m else math.inf}
+    if avg_g:
+        rooms["GHz"] = (active * r["eff_ghz"] - ghz) / avg_g
+    limit = min(rooms, key=rooms.get)
+    return {"vms": math.floor(rooms[limit] + EPS), "limit": limit}
 
 
 def add_headroom(r):
     if not r["tot_vms"]:
-        r.update(avg_vm_vcpu=0.0, avg_vm_ram=0.0, headroom_now=None, headroom_fut=None, vms_per_host=None)
+        r.update(avg_vm_vcpu=0.0, avg_vm_ram=0.0, avg_vm_ghz=0.0, headroom_now=None, headroom_fut=None, vms_per_host=None)
         return
     avg_c, avg_m = r["tot_vcpu"] / r["tot_vms"], r["tot_ram"] / r["tot_vms"]
+    avg_g = r["perf_ghz"] / r["tot_vms"] if r.get("has_perf") else 0.0
     per_c = r["eff_cores"] * r["vcpu_ratio"] / avg_c if avg_c else math.inf
     per_m = r["eff_ram"] / avg_m if avg_m else math.inf
-    r.update(avg_vm_vcpu=avg_c, avg_vm_ram=avg_m,
-             headroom_now=vm_headroom(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"]),
-             headroom_fut=vm_headroom(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"]),
-             vms_per_host=math.floor(min(per_c, per_m) + EPS) if min(per_c, per_m) != math.inf else None)
+    per_g = r["eff_ghz"] / avg_g if avg_g else math.inf
+    per = min(per_c, per_m, per_g)
+    r.update(avg_vm_vcpu=avg_c, avg_vm_ram=avg_m, avg_vm_ghz=avg_g,
+             headroom_now=vm_headroom(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"], r["perf_ghz"]),
+             headroom_fut=vm_headroom(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"], r.get("fut_ghz", 0.0)),
+             vms_per_host=math.floor(per + EPS) if per != math.inf else None)
 
 
 def headroom_text(h):
@@ -300,7 +306,7 @@ def headroom_view(h, ok_text):
     if h is None:
         return "n/a", "", ""
     if h["vms"] >= 0:
-        return f"{h['vms']:,}", "more VMs", f"{ok_text} {h['limit']} runs out first."
+        return f"{h['vms']:,}", "more VMs", f"{ok_text} {constraint_name(h['limit'])} runs out first."
     return f"{-h['vms']:,}", "VMs short", "Already short of the design rules at this host count."
 
 
@@ -454,6 +460,95 @@ def list_projects(folder=None):
             meta = {"name": fn, "error": str(exc)}
         items.append((path, meta))
     return sorted(items, key=lambda x: x[1].get("saved") or "", reverse=True)
+
+
+# ---------- processor catalog (Target hardware > Processor) ----------
+# Current and previous server generations, P-core / full-feature parts only. Base (rated) clock in GHz -
+# guaranteed under full load, so it is the conservative figure for measured-CPU sizing.
+# (model, cores per socket, base GHz, max sockets, note)
+CPU_FAMILIES = [
+    ("Intel", "Xeon 6 (Granite Rapids)", "Intel Xeon", [
+        ("6505P", 12, 2.2, 2, ""), ("6507P", 8, 3.5, 2, ""), ("6511P", 16, 2.3, 1, ""), ("6515P", 16, 2.3, 2, ""),
+        ("6517P", 16, 3.2, 2, ""), ("6520P", 24, 2.4, 2, ""), ("6521P", 24, 2.6, 1, ""), ("6527P", 24, 3.0, 2, ""),
+        ("6530P", 32, 2.3, 2, ""), ("6714P", 8, 4.0, 8, ""), ("6724P", 16, 3.6, 8, ""), ("6728P", 24, 2.7, 8, ""),
+        ("6730P", 32, 2.5, 2, ""), ("6731P", 32, 2.5, 1, ""), ("6732P", 32, 3.8, 2, ""), ("6736P", 36, 2.0, 2, ""),
+        ("6737P", 32, 2.9, 2, ""), ("6738P", 32, 2.9, 8, ""), ("6740P", 48, 2.1, 2, ""), ("6741P", 48, 2.5, 1, ""),
+        ("6745P", 32, 3.1, 2, ""), ("6747P", 48, 2.7, 2, ""), ("6748P", 48, 2.5, 2, ""), ("6760P", 64, 2.2, 2, ""),
+        ("6761P", 64, 2.5, 1, ""), ("6762P", 64, 2.9, 2, ""), ("6767P", 64, 2.4, 2, ""), ("6768P", 64, 2.4, 8, ""),
+        ("6774P", 64, 2.5, 1, ""), ("6776P", 64, 2.3, 2, ""), ("6781P", 80, 2.0, 1, ""), ("6787P", 86, 2.0, 2, ""),
+        ("6788P", 86, 2.0, 8, ""), ("6944P", 72, 1.8, 2, "6900P"), ("6952P", 96, 2.1, 2, "6900P"),
+        ("6960P", 72, 2.7, 2, "6900P"), ("6962P", 72, 2.7, 2, "6900P"), ("6966P-C", 96, 3.1, 2, "6900P"),
+        ("6972P", 96, 2.4, 2, "6900P"), ("6979P", 120, 2.1, 2, "6900P"), ("6980P", 128, 2.0, 2, "6900P"),
+    ]),
+    ("Intel", "5th Gen Xeon Scalable (Emerald Rapids)", "Intel Xeon", [
+        ("4509Y", 8, 2.6, 2, ""), ("4510", 12, 2.4, 2, ""), ("4514Y", 16, 2.0, 2, ""), ("4516Y+", 24, 2.2, 2, ""),
+        ("5512U", 28, 2.1, 1, ""), ("5515+", 8, 3.2, 2, ""), ("5520+", 28, 2.2, 2, ""), ("6526Y", 16, 2.8, 2, ""),
+        ("6530", 32, 2.1, 2, ""), ("6534", 8, 3.9, 2, ""), ("6538N", 32, 2.1, 2, ""), ("6538Y+", 32, 2.2, 2, ""),
+        ("6542Y", 24, 2.9, 2, ""), ("6544Y", 16, 3.6, 2, ""), ("6548N", 32, 2.8, 2, ""), ("6548Y+", 32, 2.5, 2, ""),
+        ("6554S", 36, 2.2, 2, ""), ("6558Q", 32, 3.2, 2, "liquid cooled"), ("8558", 48, 2.1, 2, ""),
+        ("8558P", 48, 2.7, 2, ""), ("8558U", 48, 2.0, 1, ""), ("8562Y+", 32, 2.8, 2, ""), ("8568Y+", 48, 2.3, 2, ""),
+        ("8570", 56, 2.1, 2, ""), ("8571N", 52, 2.4, 2, ""), ("8580", 60, 2.0, 2, ""), ("8581V", 60, 2.0, 1, ""),
+        ("8592+", 64, 1.9, 2, ""), ("8592V", 64, 2.0, 2, ""), ("8593Q", 64, 2.2, 2, "liquid cooled"),
+    ]),
+    ("AMD", "EPYC 9005 (Turin)", "AMD EPYC", [
+        ("9015", 8, 3.6, 2, ""), ("9115", 16, 2.6, 2, ""), ("9135", 16, 3.65, 2, ""), ("9175F", 16, 4.2, 2, ""),
+        ("9255", 24, 3.25, 2, ""), ("9275F", 24, 4.1, 2, ""), ("9335", 32, 3.0, 2, ""), ("9355", 32, 3.55, 2, ""),
+        ("9355P", 32, 3.55, 1, ""), ("9365", 36, 3.4, 2, ""), ("9375F", 32, 3.8, 2, ""), ("9455", 48, 3.15, 2, ""),
+        ("9455P", 48, 3.15, 1, ""), ("9475F", 48, 3.65, 2, ""), ("9535", 64, 2.4, 2, ""), ("9555", 64, 3.2, 2, ""),
+        ("9555P", 64, 3.2, 1, ""), ("9565", 72, 3.15, 2, ""), ("9575F", 64, 3.3, 2, ""), ("9655", 96, 2.5, 2, ""),
+        ("9655P", 96, 2.5, 1, ""), ("9755", 128, 2.7, 2, ""), ("9645", 96, 2.3, 2, "Zen 5c dense"),
+        ("9745", 128, 2.4, 2, "Zen 5c dense"), ("9825", 144, 2.2, 2, "Zen 5c dense"),
+        ("9845", 160, 2.1, 2, "Zen 5c dense"), ("9965", 192, 2.25, 2, "Zen 5c dense"),
+    ]),
+    ("AMD", "EPYC 9004 (Genoa)", "AMD EPYC", [
+        ("9124", 16, 3.0, 2, ""), ("9174F", 16, 4.1, 2, ""), ("9184X", 16, 3.55, 2, "3D V-Cache"),
+        ("9224", 24, 2.5, 2, ""), ("9254", 24, 2.9, 2, ""), ("9274F", 24, 4.05, 2, ""), ("9334", 32, 2.7, 2, ""),
+        ("9354", 32, 3.25, 2, ""), ("9354P", 32, 3.25, 1, ""), ("9374F", 32, 3.85, 2, ""),
+        ("9384X", 32, 3.1, 2, "3D V-Cache"), ("9454", 48, 2.75, 2, ""), ("9454P", 48, 2.75, 1, ""),
+        ("9474F", 48, 3.6, 2, ""), ("9534", 64, 2.45, 2, ""), ("9554", 64, 3.1, 2, ""), ("9554P", 64, 3.1, 1, ""),
+        ("9634", 84, 2.25, 2, ""), ("9654", 96, 2.4, 2, ""), ("9654P", 96, 2.4, 1, ""),
+        ("9684X", 96, 2.55, 2, "3D V-Cache"), ("9734", 112, 2.2, 2, "Zen 4c dense"),
+        ("9754", 128, 2.25, 2, "Zen 4c dense"), ("9754S", 128, 2.25, 2, "Zen 4c dense, no SMT"),
+    ]),
+]
+CPU_CUSTOM = "Custom (enter cores and GHz)"
+
+
+def _cpu_catalog():
+    """Flat processor list in dropdown order: vendor, generation (newest first), then cores and GHz."""
+    out = []
+    for vendor, gen, brand, models in CPU_FAMILIES:
+        for model, cores, ghz, max_s, note in sorted(models, key=lambda m: (m[1], m[2], m[0])):
+            extras = [x for x in (note, "1-socket only" if max_s == 1 else "") if x]
+            label = (f"{vendor} {gen} · {model} · {cores} cores · {ghz:.2f} GHz"
+                     + (f" · {', '.join(extras)}" if extras else ""))
+            out.append({"label": label, "vendor": vendor, "gen": gen, "name": f"{brand} {model}",
+                        "cores": cores, "ghz": ghz, "max_sockets": max_s, "note": note})
+    return out
+
+
+CPU_CATALOG = _cpu_catalog()
+CPU_BY_LABEL = {c["label"]: c for c in CPU_CATALOG}
+CPU_OPTIONS = [CPU_CUSTOM] + [c["label"] for c in CPU_CATALOG]
+# RAM per host: typical 2-socket configurations on current servers (every channel filled, multiples of 256 GB)
+RAM_OPTIONS = [256, 512, 768, 1024, 1536, 2048, 3072, 4096]
+RAM_MIN, RAM_MAX = 64, 8192
+
+
+def selected_cpu(p):
+    """The chosen catalog processor, only while cores per socket and GHz still match it."""
+    c = CPU_BY_LABEL.get(p.get("cpu_model") or "")
+    if c and int(p.get("cores") or 0) == c["cores"] and round(float(p.get("clock") or 0), 2) == round(c["ghz"], 2):
+        return c
+    return None
+
+
+def host_cpu_text(r):
+    """'2 x Intel Xeon 6737P (32 cores, 2.90 GHz base)' or '2 sockets x 32 cores at 2.90 GHz'."""
+    c = selected_cpu(r)
+    if c:
+        return f"{r['sockets']} x {c['name']} ({c['cores']} cores, {c['ghz']:.2f} GHz base)"
+    return f"{r['sockets']} socket{'' if r['sockets'] == 1 else 's'} x {r['cores']} cores at {float(r['clock']):.2f} GHz"
 
 
 # =============================================================================
@@ -686,15 +781,19 @@ def license_cores_per_host(sockets, cores_per_socket):
     return sockets * max(cores_per_socket, LIC_MIN_CORES_PER_SOCKET)
 
 
-def design_status(r, hosts, vcpu, ram):
+def design_status(r, hosts, vcpu, ram, ghz=0.0):
     """Failover load for a host count against the design rules."""
     active = hosts - r["ha_nodes"]
     usable_ram = max(active, 0) * r["eff_ram"]
+    usable_ghz = max(active, 0) * r.get("eff_ghz", 0.0)
     cpu_ratio = vcpu / (active * r["eff_cores"]) if active > 0 and r["eff_cores"] else 0.0
     ram_use = ram / usable_ram if usable_ram else 0.0
+    ghz_use = ghz / usable_ghz if r.get("has_perf") and usable_ghz else None
     return {"active": active, "usable_ram": usable_ram, "cpu_ratio": cpu_ratio, "ram_use": ram_use,
+            "usable_ghz": usable_ghz, "ghz_use": ghz_use,
             "cpu_ok": active > 0 and cpu_ratio <= r["vcpu_ratio"] + EPS,
             "ram_ok": active > 0 and ram_use <= 1 + EPS,
+            "ghz_ok": ghz_use is None or (active > 0 and ghz_use <= 1 + EPS),
             "ha_ok": active > 0, "min_ok": hosts >= r["min_hosts"]}
 
 
@@ -707,7 +806,7 @@ def hv_label(r):
     return f"{r['hypervisor']} {r['hv_kind']} {r['hv_ratio']:.1f}:1"
 
 
-def capacity_checks(r, hosts, vcpu, ram, calc_hosts):
+def capacity_checks(r, hosts, vcpu, ram, calc_hosts, ghz=0.0):
     """Validate a (possibly forced) host count against the design rules.
     Returns list of (is_problem, text)."""
     ha, out = r["ha_nodes"], []
@@ -725,11 +824,16 @@ def capacity_checks(r, hosts, vcpu, ram, calc_hosts):
     if ram_use > 1 + EPS:
         out.append((True, f"RAM: workload needs {ram_use:.0%} of usable RAM during HA failover "
                           f"({ram:,.0f} GB vs {active * r['eff_ram']:,.0f} GB)."))
+    ghz_use = ghz / (active * r["eff_ghz"]) if r.get("has_perf") and r.get("eff_ghz") else None
+    if ghz_use is not None and ghz_use > 1 + EPS:
+        out.append((True, f"Measured CPU: workload needs {ghz_use:.0%} of usable GHz during HA failover "
+                          f"({ghz:,.0f} GHz vs {active * r['eff_ghz']:,.0f} GHz at {PERF_TARGET_UTIL:.0%} target)."))
     if not out:
         extra = hosts - calc_hosts
         tail = f" ({extra} host{'s' if extra != 1 else ''} above the calculated {calc_hosts})." if extra > 0 else "."
+        ghz_txt = f", {ghz_use:.0%} of usable GHz" if ghz_use is not None else ""
         out.append((False, f"{hl} meets the CPU and RAM design limits with N+{ha} HA{tail} "
-                           f"Failover load: {cpu_ratio:.1f}:1 vCPU per usable core, {ram_use:.0%} of usable RAM."))
+                           f"Failover load: {cpu_ratio:.1f}:1 vCPU per usable core, {ram_use:.0%} of usable RAM{ghz_txt}."))
     return out
 
 
@@ -749,19 +853,27 @@ def compute_sizing(inv, p):
                                   "has_perf", "perf_ghz", "perf_estimated", "lic_edition", "esxi_version",
                                   "vm_on", "vm_off")})
     r["storage"] = inv["storage"]
+    r["perf_paired"] = inv.get("perf_paired", [])
     hv = p.get("hypervisor") or DEFAULT_HYPERVISOR
     r["hypervisor"] = hv
     r["hv_ratio"], r["hv_kind"], r["hv_note"] = HYPERVISORS.get(hv, HYPERVISORS[DEFAULT_HYPERVISOR])
-    r.update(host_cores=host_cores, eff_cores=eff_cores, eff_ram=eff_ram,
+    # Usable GHz per host for measured (Live Optics) demand: overhead removed, kept at the target utilisation
+    eff_ghz = host_cores * p["clock"] * (1 - p["cpu_buffer"] / 100) * PERF_TARGET_UTIL
+    r.update(host_cores=host_cores, eff_cores=eff_cores, eff_ram=eff_ram, eff_ghz=eff_ghz,
              tgt_numa_cores=numa_cores, tgt_numa_ram=numa_ram)
+    use_ghz = bool(r["has_perf"]) and eff_ghz > 0
 
-    def size(vcpu, ram):
+    def size(vcpu, ram, ghz=0.0):
+        """Hosts by vCPU ratio, measured GHz (Live Optics) and RAM; the largest wins."""
         h_cpu = ceil_div(vcpu / p["vcpu_ratio"], eff_cores)
         h_ram = ceil_div(ram, eff_ram)
-        constraint = "CPU" if h_cpu > h_ram else ("RAM" if h_ram > h_cpu else "Balanced")
-        raw = max(h_cpu, h_ram)
+        h_ghz = ceil_div(ghz, eff_ghz) if use_ghz else 0
+        need = {"CPU": h_cpu, "GHz": h_ghz, "RAM": h_ram}
+        raw = max(need.values())
+        top = [k for k, v in need.items() if v == raw]
+        constraint = top[0] if len(top) == 1 and raw > 0 else "Balanced"
         total = max(raw + ha, min_hosts)
-        return h_cpu, h_ram, raw, constraint, total, (raw + ha) < min_hosts
+        return h_cpu, h_ram, h_ghz, raw, constraint, total, (raw + ha) < min_hosts
 
     def ratios(vcpu, hosts):
         all_hosts = vcpu / (hosts * host_cores) if hosts > 0 else 0.0
@@ -769,8 +881,8 @@ def compute_sizing(inv, p):
         return all_hosts, failover
 
     # Current
-    r["hosts_cpu"], r["hosts_ram"], r["raw_hosts"], r["constraint"], r["hosts_now"], r["min_applied_now"] = \
-        size(r["tot_vcpu"], r["tot_ram"])
+    r["hosts_cpu"], r["hosts_ram"], r["hosts_ghz"], r["raw_hosts"], r["constraint"], r["hosts_now"], r["min_applied_now"] = \
+        size(r["tot_vcpu"], r["tot_ram"], r["perf_ghz"])
     r["calc_hosts_now"] = r["hosts_now"]
     r["override_now"] = bool(p.get("override"))
     if r["override_now"]:
@@ -791,8 +903,9 @@ def compute_sizing(inv, p):
     # Future (compound growth)
     mult = (1 + p["growth"]) ** p["years"]
     r["fut_vcpu"], r["fut_ram"] = r["tot_vcpu"] * mult, r["tot_ram"] * mult
-    r["fut_hosts_cpu"], r["fut_hosts_ram"], r["fut_raw_hosts"], r["fut_constraint"], r["hosts_fut"], r["min_applied_fut"] = \
-        size(r["fut_vcpu"], r["fut_ram"])
+    r["fut_ghz"] = r["perf_ghz"] * mult
+    r["fut_hosts_cpu"], r["fut_hosts_ram"], r["fut_hosts_ghz"], r["fut_raw_hosts"], r["fut_constraint"], r["hosts_fut"], \
+        r["min_applied_fut"] = size(r["fut_vcpu"], r["fut_ram"], r["fut_ghz"])
     r["calc_hosts_fut"] = r["hosts_fut"]
     r["override_fut"] = r["override_now"] and bool(p.get("override_future", True))
     if r["override_fut"]:
@@ -800,18 +913,17 @@ def compute_sizing(inv, p):
     r["ratio_fut_all"], r["ratio_fut_failover"] = ratios(r["fut_vcpu"], r["hosts_fut"])
 
     # Design-rule validation (most useful when a host count is forced)
-    r["checks_now"] = capacity_checks(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"], r["calc_hosts_now"])
-    r["checks_fut"] = capacity_checks(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"], r["calc_hosts_fut"])
-    r["design_now"] = design_status(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"])
-    r["design_fut"] = design_status(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"])
+    r["checks_now"] = capacity_checks(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"], r["calc_hosts_now"], r["perf_ghz"])
+    r["checks_fut"] = capacity_checks(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"], r["calc_hosts_fut"], r["fut_ghz"])
+    r["design_now"] = design_status(r, r["hosts_now"], r["tot_vcpu"], r["tot_ram"], r["perf_ghz"])
+    r["design_fut"] = design_status(r, r["hosts_fut"], r["fut_vcpu"], r["fut_ram"], r["fut_ghz"])
     r["power_scope"] = power_mode(p)
     add_headroom(r)
 
     # Performance sizing (Live Optics) - GHz demand, but never below the RAM requirement
     r["perf_hosts_ghz"], r["perf_hosts_rec"], r["perf_constraint"] = 0, 0, ""
     if r["has_perf"]:
-        node_ghz = host_cores * p["clock"] * (1 - p["cpu_buffer"] / 100) * PERF_TARGET_UTIL
-        r["perf_hosts_ghz"] = ceil_div(r["perf_ghz"], node_ghz)
+        r["perf_hosts_ghz"] = r["hosts_ghz"]
         perf_raw = max(r["perf_hosts_ghz"], r["hosts_ram"])
         r["perf_constraint"] = "CPU (GHz)" if r["perf_hosts_ghz"] >= r["hosts_ram"] else "RAM"
         r["perf_hosts_rec"] = max(perf_raw + ha, min_hosts)
@@ -822,17 +934,29 @@ def compute_sizing(inv, p):
     return r
 
 
+def constraint_name(c):
+    return {"CPU": "CPU (vCPU ratio)", "GHz": "CPU (measured GHz)", "RAM": "RAM"}.get(c, "CPU and RAM balanced")
+
+
 def sizing_logic_lines(r):
     """Plain-text explanation, shared by the UI and the report."""
     lines = [
         f"Workload: {r['tot_vcpu']:,.0f} vCPU and {r['tot_ram']:,.0f} GB vRAM across {r['tot_vms']:,} VMs.",
         f"Effective host after overhead: {r['eff_cores']:.1f} cores (x {r['vcpu_ratio']:.1f}:1 = "
         f"{r['eff_cores'] * r['vcpu_ratio']:,.0f} vCPU) and {r['eff_ram']:,.0f} GB RAM.",
-        f"Hosts needed: CPU {r['hosts_cpu']}, RAM {r['hosts_ram']} -> {r['constraint']} bound, {r['raw_hosts']} active hosts.",
+        (f"Measured CPU: {r['perf_ghz']:,.0f} GHz ({r['lo_basis']}) against {r['eff_ghz']:,.0f} usable GHz per host "
+         f"({PERF_TARGET_UTIL:.0%} target)." if r["has_perf"] else None),
+        f"Hosts needed: CPU (vCPU ratio) {r['hosts_cpu']}"
+        + (f", CPU (measured GHz) {r['hosts_ghz']}" if r["has_perf"] else "")
+        + f", RAM {r['hosts_ram']} -> {constraint_name(r['constraint'])} bound, {r['raw_hosts']} active hosts.",
         f"Final: {r['raw_hosts']} + {r['ha_nodes']} HA = {r['raw_hosts'] + r['ha_nodes']}"
         + (f", raised to the {r['min_hosts']}-host minimum cluster size." if r["min_applied_now"] else "."),
         f"Hypervisor: {r['hypervisor']} - {r['hv_ratio']:.1f}:1 vCPU:pCPU is the {r['hv_kind']} guidance. {r['hv_note']}",
     ]
+    if r.get("perf_paired"):
+        lines.insert(2, "Measured CPU comes from paired Live Optics clusters: "
+                     + "; ".join(f"{a} ← {b}" for a, b in r["perf_paired"]) + ". VMs, vCPU and RAM come from RVTools.")
+    lines = [x for x in lines if x]
     if r["override_now"]:
         lines.append(f"Manual override: {r['hosts_now']} host{'s' if r['hosts_now'] != 1 else ''} used instead of the calculated {r['calc_hosts_now']}"
                      + (f" (future: calculated {r['calc_hosts_fut']})." if r["override_fut"] else "."))
@@ -1192,7 +1316,7 @@ def generate_html_report(r, customer_logo_uri=None):
     # ---------- Hero ----------
     prepared = (f"<div class='chip'><img src='{customer_logo_uri}' alt='{e(r['customer'])}'></div>"
                 if customer_logo_uri else f"<div class='chip'>{e(r['customer'])}</div>")
-    constraint_txt = "CPU and RAM balanced" if r["constraint"] == "Balanced" else f"{r['constraint']} bound"
+    constraint_txt = "CPU and RAM balanced" if r["constraint"] == "Balanced" else f"{constraint_name(r['constraint'])} bound"
     day1_cap = (f"Proposed Day 1 · manual override (calculated {r['calc_hosts_now']})" if r["override_now"]
                 else f"Recommended Day 1 · N+{r['ha_nodes']} · {constraint_txt}")
     stats = [
@@ -1234,7 +1358,7 @@ def generate_html_report(r, customer_logo_uri=None):
         title = "Current refresh requirement" if now else f"Future requirement · {r['years']} years"
         tag = host_label(r, which)[1]
         all_r, fo_r = (r["ratio_now_all"], r["ratio_now_failover"]) if now else (r["ratio_fut_all"], r["ratio_fut_failover"])
-        cons = r["constraint"] if now else r["fut_constraint"]
+        cons = constraint_name(r["constraint"] if now else r["fut_constraint"])
         detail = (f"<strong>N+{r['ha_nodes']} · {e(cons)} constraint.</strong> "
                   + (f"Sized for {r['tot_vcpu']:,.0f} vCPU and {r['tot_ram']:,.0f} GB vRAM."
                      if now else f"Projected {r['fut_vcpu']:,.0f} vCPU and {r['fut_ram']:,.0f} GB vRAM at "
@@ -1250,7 +1374,7 @@ def generate_html_report(r, customer_logo_uri=None):
     d = r["design_now"]
     panel_cards = [
         ("Target node", f"{r['host_cores']} cores · {r['ram']:,} GB",
-         f"{r['sockets']} socket{'' if r['sockets'] == 1 else 's'} x {r['cores']} cores. {r['cpu_buffer']}% CPU and {r['ram_buffer']}% RAM reserved for overhead.",
+         f"{host_cpu_text(r)}. {r['cpu_buffer']}% CPU and {r['ram_buffer']}% RAM reserved for overhead.",
          pill(True, "Design input", "info")),
         ("CPU", f"{d['cpu_ratio']:.1f}:1 at failover",
          f"vCPU per usable core with {plural(r['ha_nodes'], 'host')} down. Design limit {r['vcpu_ratio']:.1f}:1; "
@@ -1264,6 +1388,11 @@ def generate_html_report(r, customer_logo_uri=None):
          f"Minimum cluster size {r['min_hosts']}. {plural(max(d['active'], 0), 'host')} carry the workload after a failure.",
          pill(d["ha_ok"] and d["min_ok"], "Met" if d["ha_ok"] and d["min_ok"] else "Not met")),
     ]
+    if d.get("ghz_use") is not None:
+        panel_cards.insert(2, ("Measured CPU", f"{d['ghz_use']:.0%} of usable GHz",
+                               f"{r['perf_ghz']:,.0f} GHz ({e(r['lo_basis'])}) against {d['usable_ghz']:,.0f} GHz usable during "
+                               f"HA failover at a {PERF_TARGET_UTIL:.0%} target.",
+                               pill(d["ghz_ok"], "Fits" if d["ghz_ok"] else "Short on CPU")))
     panel_html = "".join(
         f"<div class='pcard'><div class='eyebrow'>{e(a)}</div><h4>{e(b)}</h4><p>{e(c)}</p>{pl}</div>"
         for a, b, c, pl in panel_cards)
@@ -1346,7 +1475,7 @@ def generate_html_report(r, customer_logo_uri=None):
     <span class="divider"></span>
     <span class="eyebrow muted">Scope</span><div class="chip">{e(r['scope_label'])}</div>
   </div>
-  <div class="eyebrow kicker">{e(r['hypervisor'])} sizing · {e(r['source_type'])} analysis{' · DR (powered-off VMs)' if r.get('power_scope') == POWER_OFF else ''} · {now:%b %d, %Y}</div>
+  <div class="eyebrow kicker">{e(r['hypervisor'])} sizing · {e(r['source_type'])} analysis{' · DR (powered-off VMs)' if r.get('power_scope') == POWER_OFF else ''}{(' · ' + e(r['workload_label'])) if r.get('workload_label') else ''} · {now:%b %d, %Y}</div>
   <h1>{e(r['customer'])} host sizing: <em>today</em> + <em>tomorrow</em></h1>
   <p class="lede">{e(hero_lede)}</p>
   <div class="stats">{stats_html}</div>
@@ -1406,7 +1535,7 @@ def generate_html_report(r, customer_logo_uri=None):
   </div>
 </div></section>
 {perf_html}
-{method_section_html([r], "alt" if perf_html else "")}
+{method_section_html([r], "alt" if not perf_html else "")}
 <footer><div class="wrap">
   {f'<img src="{ahead_white}" alt="AHEAD">' if ahead_white else '<strong>AHEAD</strong>'}
   <span>Confidential - Proprietary to AHEAD · Prepared for {e(r['customer'])}</span>
@@ -1550,9 +1679,10 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
     def row(it, total=False):
         r = it["r"]
         tag = " <span class='tag mini'>override</span>" if r["override_now"] else ""
-        return (f"<tr><td>{go(it)}</td><td>{e(r['hypervisor'])}</td><td>{f0(r['tot_vms'])}</td><td>{f0(r['cur_host_count'])}</td>"
+        wl = f"<br><small>{e(r['workload_label'])}</small>" if r.get("workload_label") else ""
+        return (f"<tr><td>{go(it)}{wl}</td><td>{e(r['hypervisor'])}</td><td>{f0(r['tot_vms'])}</td><td>{f0(r['cur_host_count'])}</td>"
                 f"<td class='hl'>{r['hosts_now']}{tag}</td><td>{r['hosts_fut']}</td><td>{fmt_ratio(r['ratio_now_failover'])}</td>"
-                f"<td>{e(r['constraint'])}</td><td>{status(it)}</td></tr>")
+                f"<td>{e(constraint_name(r['constraint']))}</td><td>{status(it)}</td></tr>")
     head = ("<tr><th>{}</th><th>Hypervisor</th><th>VMs</th><th>Current hosts</th><th>Day 1 hosts</th><th>Future hosts</th>"
             "<th>Day 1 failover ratio</th><th>Constraint</th><th>Status</th></tr>")
     all_clear = "" if n_flags else "<span class='pill ok'>All clear</span>"
@@ -1727,7 +1857,6 @@ APP_CSS = """<style>
 .hs-update a.dl { background: #00B388; color: #FFFFFF; padding: 6px 14px; margin-right: 8px; }
 .hs-update a.nt { color: #67C3E9; }
 .hs-update .mac { margin-top: 8px; font-size: 11.5px; color: rgba(255,255,255,.7); }
-.hs-brand .ver { margin-top: 8px; font-size: 11.5px; letter-spacing: .04em; color: #8C9BAB; }
 .hs-brand img.lockup { width: 100%; max-width: 230px; height: auto; display: block; }
 .hs-brand .name { font-size: 30px; font-weight: 700; color: #FFFFFF; line-height: 1.05; letter-spacing: -.01em; }
 .hs-brand .pb { display: flex; align-items: center; gap: 7px; margin-top: 7px; font-size: 12px; color: rgba(255,255,255,.8); }
@@ -1761,10 +1890,10 @@ DEFAULTS = {
     "hypervisor": DEFAULT_HYPERVISOR, "vcpu_ratio": HYPERVISORS[DEFAULT_HYPERVISOR][0], "cpu_buffer": 10, "ram_buffer": 10, "min_hosts": 2, "ha_nodes": 1,
     "override": False, "override_hosts": 4, "override_future": True,
     "include_off": True, "power_scope": POWER_ALL, "growth_pct": 10.0, "years": 3,
-    "customer": "My Customer", "scope": [],
+    "customer": "My Customer", "scope": [], "cpu_model": CPU_CUSTOM,
     "cmp_view": "Both", "preview_view": "Consolidated", "upload_mode": "Add to active project", "raw_view": "VMs", "raw_cols": "Key columns", "raw_search": "",
 }
-PARAM_KEYS = ["hypervisor", "sockets", "cores", "ram", "clock", "lo_basis", "vcpu_ratio", "cpu_buffer", "ram_buffer",
+PARAM_KEYS = ["hypervisor", "cpu_model", "sockets", "cores", "ram", "clock", "lo_basis", "vcpu_ratio", "cpu_buffer", "ram_buffer",
               "min_hosts", "ha_nodes", "override", "override_hosts", "override_future",
               "include_off", "power_scope", "years", "customer"]
 
@@ -1959,10 +2088,12 @@ def default_alias(src, taken=()):
     return name
 
 
-def source_ids(entry, include_disabled=False):
-    """[(cluster id, source uid, cluster name)] across the project's sources."""
+def source_ids(entry, include_disabled=False, include_paired=False):
+    """[(cluster id, source uid, cluster name)] across the project's sources. Live Optics clusters paired with an
+    RVTools cluster are hidden (their measured CPU is used by the RVTools cluster) unless include_paired."""
     srcs = entry_sources(entry)
     multi = len(srcs) > 1
+    hidden = set() if include_paired else set((entry.get("pairs") or {}).values())
     out = []
     for src in srcs:
         if not include_disabled and not src.get("enabled", True):
@@ -1974,7 +2105,9 @@ def source_ids(entry, include_disabled=False):
         if stype is None:
             continue
         for c in cluster_list(stype, sheets):
-            out.append((f"{src['alias']}{SRC_SEP}{c}" if multi else c, src["uid"], c))
+            cid = f"{src['alias']}{SRC_SEP}{c}" if multi else c
+            if cid not in hidden:
+                out.append((cid, src["uid"], c))
     return out
 
 
@@ -2000,8 +2133,11 @@ def parse_entry(entry, scope, p):
     """Inventory for a scope (list of cluster ids, or None for everything) across all enabled sources.
     Out-of-scope clusters are left out. Returns (inventory, source type label, file names)."""
     srcs = [s for s in entry_sources(entry) if s.get("enabled", True)]
-    ids = source_ids(entry)
+    pairs = active_pairs(entry)
+    ids = source_ids(entry, include_paired=True)
     everything = scope is None
+    if pairs and scope is None:
+        scope = [cid for cid, _, _ in source_ids(entry)]      # paired Live Optics clusters aren't counted twice
     scope = active_scope(entry, scope)
     clustered = {uid for _, uid, _ in ids}
     parts = []
@@ -2021,6 +2157,8 @@ def parse_entry(entry, scope, p):
                 continue
         inv = (parse_rvtools(sheets, local, p["power_scope"]) if stype == "RVTools"
                else parse_live_optics(sheets, local, p["power_scope"], p["lo_basis"]))
+        if stype == "RVTools" and pairs and local:
+            add_paired_perf(entry, src, local, pairs, inv, p)
         parts.append((src, stype, inv))
     if not parts:
         raise ValueError("None of the enabled sources has data for this selection.")
@@ -2029,6 +2167,31 @@ def parse_entry(entry, scope, p):
     if len(parts) == 1 and len(entry_sources(entry)) == 1:
         return parts[0][2], label, files
     return merge_inventories(parts), label, files
+
+
+def add_paired_perf(entry, src, local, pairs, inv, p):
+    """Give RVTools clusters the measured CPU (GHz) of their paired Live Optics clusters. Only when every
+    cluster in the selection is paired, so the measured demand covers the whole workload."""
+    rv_ids = {c: cid for cid, uid, c in source_ids(entry, include_paired=True) if uid == src["uid"]}
+    lo_ids = {cid: (uid, c) for cid, uid, c in source_ids(entry, include_paired=True)}
+    wanted = [pairs.get(rv_ids.get(c)) for c in local]
+    if not wanted or any(w is None or w not in lo_ids for w in wanted):
+        return
+    by_src = {}
+    for w in wanted:
+        uid, c = lo_ids[w]
+        by_src.setdefault(uid, []).append(c)
+    ghz, est, ok = 0.0, False, True
+    for uid, names in by_src.items():
+        lo_src = next(s for s in entry_sources(entry) if s["uid"] == uid)
+        lo_type, lo_sheets = source_data(lo_src)
+        lo_inv = parse_live_optics(lo_sheets, names, p["power_scope"], p["lo_basis"])
+        ok = ok and lo_inv["has_perf"]
+        ghz += lo_inv["perf_ghz"]
+        est = est or lo_inv["perf_estimated"]
+    if ok:
+        inv.update(has_perf=True, perf_ghz=ghz, perf_estimated=est,
+                   perf_paired=[(rv_ids[c], pairs[rv_ids[c]]) for c in local])
 
 
 def merge_inventories(parts):
@@ -2060,6 +2223,7 @@ def merge_inventories(parts):
         **{k: sum(i[k] for i in invs) for k in ("vm_prov_tb", "vm_used_tb", "guest_used_tb", "rdm_cnt", "rdm_tb")},
         "has_perf": has_perf, "perf_ghz": sum(i["perf_ghz"] for i in invs) if has_perf else 0.0,
         "perf_estimated": any(i["perf_estimated"] for i in invs),
+        "perf_paired": [x for i in invs for x in i.get("perf_paired", [])],
         "lic_edition": joined("lic_edition"), "esxi_version": joined("esxi_version"),
         "vm_on": sum(on) if on else None, "vm_off": sum(off) if off else None,
         "include_off": invs[0].get("include_off", True), "power_scope": invs[0].get("power_scope", POWER_ALL),
@@ -2136,6 +2300,10 @@ def migrate_cluster_ids(entry, before, after):
         if key in touched:
             new_t.append(nk)
     inactive = [mapping.get(c, c) for c in entry.get("inactive", [])]
+    pairs = {mapping.get(a, a): mapping.get(b, b) for a, b in (entry.get("pairs") or {}).items()}
+    entry["pairs"] = {a: b for a, b in pairs.items() if a and b}
+    labels = {mapping.get(c, c): v for c, v in (entry.get("labels") or {}).items()}
+    entry["labels"] = {c: v for c, v in labels.items() if c}
     entry.update(scope_settings=new_s, scope_lists=new_l, touched=new_t,
                  inactive=[c for c in inactive if c],
                  last_scope=conv(entry.get("last_scope", [])) or [])
@@ -2144,7 +2312,7 @@ def migrate_cluster_ids(entry, before, after):
 
 
 def id_map(entry):
-    return {(uid, c): cid for cid, uid, c in source_ids(entry, include_disabled=True)}
+    return {(uid, c): cid for cid, uid, c in source_ids(entry, include_disabled=True, include_paired=True)}
 
 
 def change_sources(entry_name, entry, change):
@@ -2157,6 +2325,141 @@ def change_sources(entry_name, entry, change):
     if ss.get("active") == entry_name:
         ss.scope = conv(list(ss.get("scope", []))) or []
         ss._scope_for = None
+
+
+# ---------- RVTools + Live Optics pairing, workload labels ----------
+def active_pairs(entry):
+    """Confirmed RVTools→Live Optics cluster pairs whose sources are both present and enabled: {rv id: lo id}."""
+    ids = {cid: uid for cid, uid, _ in source_ids(entry, include_paired=True)}
+    return {rv: lo for rv, lo in (entry.get("pairs") or {}).items() if rv in ids and lo in ids}
+
+
+def cluster_fingerprint(stype, sheets, cname):
+    """Size facts used to judge whether an RVTools and a Live Optics cluster are the same."""
+    def in_cluster(df):
+        if df is None:
+            return pd.DataFrame()
+        return df[df["Cluster"].astype(str) == cname] if "Cluster" in df.columns else df.iloc[0:0]
+    if stype == "RVTools":
+        vi, vh = in_cluster(drop_templates(sheets["vInfo"])), in_cluster(sheets.get("vHost"))
+        vm_col, host_col = "VM", first_col(vh, ["Host"]) if not vh.empty else None
+        cores = float((num_col(vh, "# CPU") * num_col(vh, "Cores per CPU")).sum()) if not vh.empty else 0.0
+        ram = float(num_col(vh, "# Memory").sum()) / 1024 if not vh.empty else 0.0
+    else:
+        vi, vh = in_cluster(drop_templates(sheets["VMs"])), in_cluster(sheets.get("ESX Hosts"))
+        vm_col, host_col = "VM Name", first_col(vh, HOST_NAME_COLS) if not vh.empty else None
+        cores = float(num_col(vh, "CPU Cores").sum()) if not vh.empty else 0.0
+        ram = float(num_col(vh, "Memory (KiB)").sum()) / 1024 / 1024 if not vh.empty else 0.0
+    names = lambda df, col: set(df[col].dropna().astype(str).str.lower()) if col and col in df.columns else set()  # noqa: E731
+    return {"hosts": len(vh), "cores": cores, "ram": ram, "vms": len(vi),
+            "vm_names": names(vi, vm_col), "host_names": names(vh, host_col)}
+
+
+def pair_confidence(a_name, fa, b_name, fb):
+    """(label, score, detail) for a candidate pair. Labels: High, Possible, Conflict, Low."""
+    def close(x, y):
+        return 1.0 if x == y == 0 else (min(x, y) / max(x, y) if max(x, y) > 0 else 0.0)
+    metric = min(close(fa[k], fb[k]) for k in ("hosts", "cores", "ram", "vms"))
+    def jac(x, y):
+        return len(x & y) / len(x | y) if x and y else 0.0
+    overlap = max(jac(fa["vm_names"], fb["vm_names"]), jac(fa["host_names"], fb["host_names"]))
+    norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())  # noqa: E731
+    same = norm(a_name) == norm(b_name)
+    if overlap >= 0.5 or (same and metric >= 0.9):
+        label = "High"
+    elif same and metric < 0.75 and overlap < 0.1:
+        label = "Conflict"          # same (often anonymised) name, but the clusters look different
+    elif same or metric >= 0.9:
+        label = "Possible"
+    else:
+        label = "Low"
+    detail = (f"Hosts {fa['hosts']} vs {fb['hosts']} · cores {fa['cores']:,.0f} vs {fb['cores']:,.0f} · "
+              f"RAM {fa['ram']:,.0f} vs {fb['ram']:,.0f} GB · VMs {fa['vms']:,} vs {fb['vms']:,}"
+              + (f" · {overlap:.0%} names shared" if overlap else ""))
+    return label, overlap * 2 + metric + (0.5 if same else 0), detail
+
+
+def pairing_candidates(entry):
+    """RVTools and Live Optics clusters available for pairing: ([(id, name, fp)], [(id, name, fp)])."""
+    srcs = {s["uid"]: s for s in entry_sources(entry) if s.get("enabled", True)}
+    rv, lo = [], []
+    for cid, uid, cname in source_ids(entry, include_paired=True):
+        src = srcs.get(uid)
+        if not src:
+            continue
+        stype, sheets = source_data(src)
+        target = rv if stype == "RVTools" else lo if stype == "LiveOptics" else None
+        if target is not None:
+            target.append((cid, cname, cluster_fingerprint(stype, sheets, cname)))
+    return rv, lo
+
+
+def pair_suggestions(entry):
+    """{rv id: (lo id, label, detail)} best High/Possible match per RVTools cluster, plus conflicts."""
+    rv, lo = pairing_candidates(entry)
+    out, conflicts, used = {}, [], set()
+    scored = []
+    for rid, rname, rfp in rv:
+        for lid, lname, lfp in lo:
+            label, score, detail = pair_confidence(rname, rfp, lname, lfp)
+            if label == "Conflict":
+                conflicts.append((rid, lid, detail))
+            elif label in ("High", "Possible"):
+                scored.append((score, rid, lid, label, detail))
+    for score, rid, lid, label, detail in sorted(scored, reverse=True):
+        if rid not in out and lid not in used:
+            out[rid] = (lid, label, detail)
+            used.add(lid)
+    return out, conflicts
+
+
+WORKLOAD_HINTS = [
+    (("sql", "mssql"), "SQL Server"), (("ora", "oracle"), "Oracle"), (("ctx", "citrix", "xen", "vda"), "Citrix"),
+    (("vdi", "horizon", "hzn"), "VDI"), (("dmz",), "DMZ"), (("epic",), "Epic"), (("sap", "hana"), "SAP"),
+    (("exch", "exchange"), "Exchange"), (("gpu", "vgpu"), "GPU"), (("dr",), "DR"),
+    (("nonprod", "dev", "test", "qa", "uat"), "Non-production"), (("mgmt", "infra", "inf"), "Infrastructure"),
+    (("prod",), "Production"),
+]
+
+
+def suggest_label(entry, cid):
+    """Workload label suggested from the cluster name, else from the most common hint in its VM names."""
+    tokens = lambda s: set(t for t in re.split(r"[^a-z0-9]+", s.lower()) if t)  # noqa: E731
+    found = {c: (uid, name) for c, uid, name in source_ids(entry, include_paired=True)}
+    if cid not in found:
+        return None, ""
+    uid, cname = found[cid]
+    def hit(toks, keys):
+        return any(t == k or (len(k) >= 3 and t.startswith(k)) for t in toks for k in keys)
+    toks = tokens(cname)
+    for keys, label in WORKLOAD_HINTS:
+        if hit(toks, keys):
+            return label, "from the cluster name"
+    src = next((s for s in entry_sources(entry) if s["uid"] == uid), None)
+    if not src:
+        return None, ""
+    fp = cluster_fingerprint(*source_data(src), cname)
+    if not fp["vm_names"]:
+        return None, ""
+    counts = {}
+    for vm in fp["vm_names"]:
+        vt = tokens(vm)
+        for keys, label in WORKLOAD_HINTS:
+            if hit(vt, keys) or any(k in vm for k in keys if len(k) >= 3):
+                counts[label] = counts.get(label, 0) + 1
+                break
+    if counts:
+        label, n = max(counts.items(), key=lambda x: x[1])
+        if n / len(fp["vm_names"]) >= 0.3:
+            return label, f"{n / len(fp['vm_names']):.0%} of VM names"
+    return None, ""
+
+
+def scope_label_text(entry, scope):
+    """Workload label(s) for a selection: the cluster's own label, or the distinct labels of its clusters."""
+    labels = entry.get("labels") or {}
+    vals = list(dict.fromkeys(labels[c] for c in (scope or []) if labels.get(c)))
+    return " / ".join(vals)
 
 
 def scope_params(values):
@@ -2202,7 +2505,7 @@ def report_items(entry):
         inv, stype, files = parse_entry(entry, scope or None, p)
         r = compute_sizing(inv, p)
         label = " + ".join(scope) if scope else ALL_CLUSTERS
-        r.update(scope_label=label, file_name=files, source_type=stype)
+        r.update(scope_label=label, file_name=files, source_type=stype, workload_label=scope_label_text(entry, scope))
         estate = not scope and not singles          # All Clusters is the whole sizing when nothing else is sized
         items.append({"key": key, "label": label, "kind": "cluster" if len(scope) == 1 or estate else "scenario", "r": r,
                       "html": generate_html_report(r, logo), "file_name": report_file_name(p["customer"], label)})
@@ -2215,6 +2518,7 @@ def report_bundle(entry_name, entry):
     logo = ss.get("cust_logo")
     sig = json.dumps({"s": entry.get("scope_settings", {}), "l": entry.get("scope_lists", {}),
                       "i": sorted(entry.get("inactive", [])),
+                      "pr": entry.get("pairs") or {}, "lb": entry.get("labels") or {},
                       "t": sorted(entry.get("touched", [])), "c": ss.customer,
                       "src": [(x["uid"], x["alias"], x.get("enabled", True)) for x in entry_sources(entry)],
                       "logo": hashlib.sha256(logo["bytes"]).hexdigest() if logo else None,
@@ -2258,7 +2562,8 @@ def build_context():
     try:
         inv, stype, files = parse_entry(entry, scope, p)
         r = compute_sizing(inv, p)
-        r.update(scope_label=scope_label, file_name=files, source_type=stype)
+        r.update(scope_label=scope_label, file_name=files, source_type=stype,
+                 workload_label=scope_label_text(entry, scope))
         html = generate_html_report(r, customer_logo_uri())
     except KeyError as exc:
         return {"error": f"A required column or tab is missing from '{name}': {exc}", "exc": exc, "name": name}
@@ -2343,6 +2648,10 @@ def page_header(title, subtitle="", ctx=None):
                       f":blue-badge[:material/description: {ctx['source']}]"
                       + (f" :blue-badge[:material/stacks: {len(ctx['sources'])} sources]" if len(ctx.get('sources', [])) > 1 else ""),
                       f":gray-badge[:material/hub: {r['scope_label']}]"]
+            if r.get("workload_label"):
+                badges.append(f":blue-badge[:material/label: {r['workload_label']}]")
+            if r.get("perf_paired"):
+                badges.append(":green-badge[:material/link: RVTools + Live Optics paired]")
             if r["override_now"]:
                 badges.append(":orange-badge[:material/lock: Host count override]")
             if r.get("power_scope") == POWER_ON:
@@ -2409,6 +2718,8 @@ def scope_bar(ctx):
                   args=(ctx["key"], cid),
                   help="Turn off to take this cluster out of scope. It won't be sized, can't be configured, "
                        "and is left out of All Clusters, consolidations and every report.")
+    if len(ss.scope) == 1:
+        render_label_editor(ctx, ss.scope[0])
     if ctx.get("out_of_scope"):
         st.markdown(":gray-badge[:material/block: Out of scope] This cluster is excluded from every sizing and report. "
                     "Turn **Active** on to include it again.")
@@ -2540,13 +2851,15 @@ def project_settings_for(customer, entry):
                           "scope_lists": entry.get("scope_lists", {}), "touched": sorted(entry.get("touched", [])),
                           "last_scope": entry.get("last_scope", []),
                           "inactive": sorted(entry.get("inactive", [])),
+                          "pairs": dict(entry.get("pairs") or {}), "labels": dict(entry.get("labels") or {}),
                           "sources": [[x["uid"], x["alias"], x.get("enabled", True)] for x in entry.get("sources", [])]})
 
 
 def settings_fingerprint(settings):
     """Part of the settings that counts as a change (which scope is on screen does not)."""
     return {"customer": settings.get("customer"), "scope_settings": settings.get("scope_settings"),
-            "sources": settings.get("sources"), "inactive": settings.get("inactive", [])}
+            "sources": settings.get("sources"), "inactive": settings.get("inactive", []),
+            "pairs": settings.get("pairs", {}), "labels": settings.get("labels", {})}
 
 
 def _activate_report(name):
@@ -2670,6 +2983,7 @@ def _open_project(path):
              "scope_settings": copy.deepcopy(scope_settings), "last_scope": list(last_scope), "customer": customer,
              "scope_lists": copy.deepcopy(settings.get("scope_lists", {})), "touched": list(settings.get("touched", [])),
              "inactive": list(settings.get("inactive", [])),
+             "pairs": dict(settings.get("pairs", {})), "labels": dict(settings.get("labels", {})),
              "saved_logo": bool(logo), "saved_at": payload.get("saved")}
     entry_sources(entry)
     entry["saved_settings"] = project_settings_for(customer, entry)
@@ -2801,7 +3115,7 @@ def render_update_notice(container):
         + "</div>")
     if not st.session_state.get("_update_toast"):
         st.session_state._update_toast = True
-        st.toast(f"Host Sizer {latest} is available. See the sidebar to download it.", icon=":material/system_update:")
+        st.toast(f"Host Sizer {latest} is available. See About in the sidebar to download it.", icon=":material/system_update:")
 
 
 # ---------- sidebar ----------
@@ -2810,14 +3124,12 @@ def render_sidebar():
     product_logo = file_data_uri(PRODUCT_LOGO_PATH)
     if product_logo:
         sb.html(f"<div class='hs-brand'><img class='lockup' src='{product_logo}' "
-                f"alt='{escape(PRODUCT_NAME)} - Powered by AHEAD'><div class='ver'>Version {escape(APP_VERSION)}</div></div>")
+                f"alt='{escape(PRODUCT_NAME)} - Powered by AHEAD'></div>")
     else:  # fallback if the logo file is missing
         logo = file_data_uri(WHITE_LOGO_PATH)
         pb = f"Powered by <img src='{logo}' alt='AHEAD'>" if logo else "Powered by AHEAD"
-        sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div>"
-                f"<div class='ver'>Version {escape(APP_VERSION)}</div></div>")
+        sb.html(f"<div class='hs-brand'><div class='name'>{escape(PRODUCT_NAME)}</div><div class='pb'>{pb}</div></div>")
 
-    render_update_notice(sb)
     has_report = CTX is not None and not CTX.get("error")
     sb.html("<div class='hs-label'>Workspace</div>")
     sb.page_link(PAGES["home"], label="Home", icon=":material/home:")
@@ -2835,6 +3147,7 @@ def render_sidebar():
             sb.caption(f"{CTX['source']} · {CTX['r']['scope_label']}")
     sb.html("<div class='hs-label'>About</div>")
     sb.caption(f"{APP_TITLE} v{APP_VERSION}")
+    render_update_notice(sb)
 
 
 # ---------- pages ----------
@@ -2916,6 +3229,110 @@ def _remove_source(entry_name, uid):
     change_sources(entry_name, entry, lambda e: e.update(sources=[x for x in e["sources"] if x["uid"] != uid]))
 
 
+NO_PAIR = "— not paired —"
+CONF_BADGE = {"High": ":green-badge[High]", "Possible": ":blue-badge[Possible]",
+              "Conflict": ":red-badge[:material/warning: Conflict]", "Low": ":gray-badge[Low]"}
+
+
+def _fill_pair_suggestions(entry_name):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    sugg, _ = pair_suggestions(entry)
+    for rid, (lid, label, _) in sugg.items():
+        ss[f"pair_{rid}"] = lid
+
+
+def _save_pairs(entry_name, rv_ids):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    chosen = {rid: ss.get(f"pair_{rid}") for rid in rv_ids}
+    chosen = {r: l for r, l in chosen.items() if l and l != NO_PAIR}
+    if len(set(chosen.values())) != len(chosen):
+        flash("error", "Each Live Optics cluster can be paired with only one RVTools cluster.")
+        return
+    entry["pairs"] = chosen
+    entry.pop("_bundle", None)
+    ss._scope_for = None
+    flash("success", f"Saved {len(chosen)} pair{'s' if len(chosen) != 1 else ''}. Paired clusters use RVTools for VMs, "
+                     "vCPU and RAM and Live Optics for measured CPU.")
+
+
+def render_pairing(entry_name, entry):
+    """Let the user pair RVTools clusters with Live Optics clusters (suggestions + confidence, user confirms)."""
+    ss = st.session_state
+    try:
+        rv, lo = pairing_candidates(entry)
+    except Exception:  # noqa: BLE001
+        return
+    if not rv or not lo:
+        return
+    sugg, conflicts = pair_suggestions(entry)
+    fps = {cid: (name, fp) for cid, name, fp in rv + lo}
+    saved = entry.get("pairs") or {}
+    with st.container(border=True):
+        st.markdown("#### Combine RVTools with Live Optics")
+        st.caption("Pair each RVTools cluster with the Live Optics capture of the same cluster: VMs, vCPU and RAM come "
+                   "from RVTools, measured CPU (GHz) from Live Optics. Names alone can't be trusted (anonymised exports "
+                   "reuse names), so each pair shows a confidence based on host, core, RAM and VM counts and shared names. "
+                   "Nothing is paired until you save.")
+        lo_opts = [NO_PAIR] + [cid for cid, _, _ in lo]
+        for rid, rname, rfp in rv:
+            key = f"pair_{rid}"
+            if key not in ss or ss[key] not in lo_opts:
+                ss[key] = saved.get(rid, NO_PAIR)
+            c1, c2, c3 = st.columns([2.2, 2.4, 3], vertical_alignment="center")
+            c1.markdown(f"**{rid}**")
+            c2.selectbox(f"Live Optics cluster for {rid}", lo_opts, key=key, label_visibility="collapsed")
+            pick = ss.get(key)
+            if pick and pick != NO_PAIR:
+                label, _, detail = pair_confidence(rname, rfp, *fps[pick])
+                c3.markdown(f"{CONF_BADGE[label]} :gray[{detail}]")
+            elif rid in sugg:
+                lid, label, _ = sugg[rid]
+                c3.markdown(f":gray[Suggested: {lid}] {CONF_BADGE[label]}")
+            else:
+                c3.markdown(":gray[No likely match found]")
+        for rid, lid, detail in conflicts:
+            st.markdown(f":red-badge[:material/warning: Name conflict] **{rid}** and **{lid}** share a name but look like "
+                        f"different clusters ({detail}). Possibly anonymised names: only pair them if you're sure.")
+        b1, b2, _ = st.columns([1.4, 1.2, 3])
+        b1.button("Fill in suggestions", icon=":material/auto_fix_high:", on_click=_fill_pair_suggestions,
+                  args=(entry_name,), width="stretch", disabled=not sugg,
+                  help="Pre-selects High and Possible matches. Review them, then Save pairs.")
+        b2.button("Save pairs", type="primary", icon=":material/link:", on_click=_save_pairs,
+                  args=(entry_name, [cid for cid, _, _ in rv]), width="stretch")
+
+
+def _set_label(entry_name, cid, value=None):
+    ss = st.session_state
+    entry = ss.reports[entry_name]
+    text = " ".join(str(value if value is not None else ss.get("cluster_label") or "").split())[:40]
+    labels = dict(entry.get("labels") or {})
+    if text:
+        labels[cid] = text
+    else:
+        labels.pop(cid, None)
+    entry["labels"] = labels
+    entry.pop("_bundle", None)
+    if value is not None:
+        ss.cluster_label = text
+
+
+def render_label_editor(ctx, cid):
+    ss = st.session_state
+    entry = ss.reports[ctx["key"]]
+    ss.cluster_label = (entry.get("labels") or {}).get(cid, "")
+    c1, c2 = st.columns([2, 3], vertical_alignment="bottom")
+    c1.text_input("Workload label", key="cluster_label", on_change=_set_label, args=(ctx["key"], cid),
+                  placeholder="e.g. SQL Server, Citrix, DMZ", max_chars=40,
+                  help="Shown in the page header and the reports. Leave empty for none.")
+    sugg, why = suggest_label(entry, cid)
+    with c2:
+        if sugg and sugg != ss.cluster_label:
+            st.button(f"Use suggestion: {sugg}", icon=":material/lightbulb:", on_click=_set_label,
+                      args=(ctx["key"], cid, sugg), help=f"Suggested {why}. Check it before using it.", key="label_sugg")
+
+
 def render_project_sources():
     """Sources card for the active project: rename, include/exclude, remove, overlap warnings."""
     ss = st.session_state
@@ -2953,7 +3370,15 @@ def render_project_sources():
                       on_click=_remove_source, args=(name, uid), width="stretch")
     if st.button("Configure clusters", type="primary", icon=":material/arrow_forward:", key="go_env"):
         st.switch_page(PAGES["env"])
+    render_pairing(name, entry)
+    paired_aliases = set()
+    ids = {cid: uid for cid, uid, _ in source_ids(entry, include_paired=True)}
+    alias_of = {x["uid"]: x["alias"] for x in srcs}
+    for rv, lo in active_pairs(entry).items():
+        paired_aliases.add(frozenset((alias_of.get(ids.get(rv)), alias_of.get(ids.get(lo)))))
     for a, b, v, h in source_overlaps(entry):
+        if frozenset((a, b)) in paired_aliases:
+            continue
         what = " and ".join(x for x in (f"{v:,} VMs" if v else "", f"{h:,} hosts" if h else "") if x)
         st.markdown(f":orange-badge[:material/warning: Possible overlap] **{a}** and **{b}** share {what}. They may "
                     "describe the same environment; exclude one to avoid counting it twice.")
@@ -3056,6 +3481,48 @@ def _apply_hv_ratio():
     st.session_state.vcpu_ratio = HYPERVISORS[hv][0]
 
 
+def _ram_label(v):
+    try:
+        return f"{int(v):,} GB"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _ram_entered():
+    """RAM typed by hand: accept '1000', '1,000' or '1000 GB'; otherwise keep the last good value."""
+    ss = st.session_state
+    raw = str(ss.get("ram") or "").upper().replace(",", "").replace("GB", "").strip()
+    try:
+        val = int(float(raw))
+    except ValueError:
+        val = None
+    if val is None or not RAM_MIN <= val <= RAM_MAX:
+        ss.ram = int(ss.get("_ram_ok") or DEFAULTS["ram"])
+        flash("error", f"RAM per host must be a number of GB between {RAM_MIN:,} and {RAM_MAX:,}.")
+        return
+    ss.ram = val
+    ss._ram_ok = val
+
+
+def _apply_cpu():
+    """Processor picked: copy its cores per socket and base GHz into Target hardware."""
+    ss = st.session_state
+    c = CPU_BY_LABEL.get(ss.get("cpu_model") or "")
+    if not c:
+        return
+    ss.cores = c["cores"]
+    ss.clock = float(c["ghz"])
+    if c["max_sockets"] == 1:
+        ss.sockets = 1
+
+
+def _cpu_edited():
+    """Cores or GHz typed by hand: drop the processor name once they no longer match it."""
+    ss = st.session_state
+    if ss.get("cpu_model") != CPU_CUSTOM and selected_cpu(ss) is None:
+        ss.cpu_model = CPU_CUSTOM
+
+
 def render_parameters(ctx):
     with st.container(border=True):
         st.markdown("#### Sizing parameters")
@@ -3087,11 +3554,39 @@ def render_parameters(ctx):
                                           columns=["Hypervisor", "vCPU:pCPU", "Type"]),
                              hide_index=True, width="stretch")
         with t1:
+            ss = st.session_state
+            if ss.get("cpu_model") not in CPU_BY_LABEL:
+                ss.cpu_model = CPU_CUSTOM
+            st.selectbox("Processor", CPU_OPTIONS, key="cpu_model", on_change=_apply_cpu,
+                         help="Intel Xeon 6 and 5th Gen Xeon, AMD EPYC 9005 and 9004, sorted by generation and core count. "
+                              "Type to search (e.g. 6737P or 9375F). Picking one fills Cores / socket and the base clock; "
+                              "Custom keeps your own values.")
+            cpu = CPU_BY_LABEL.get(ss.cpu_model)
             c = st.columns(4)
             c[0].number_input("Sockets / host", 1, 4, key="sockets")
-            c[1].number_input("Cores / socket", 4, 128, key="cores")
-            c[2].number_input("RAM / host (GB)", 64, 8192, key="ram")
-            c[3].number_input("CPU speed (GHz)", 1.0, 5.0, key="clock", help="Used for Live Optics performance sizing")
+            c[1].number_input("Cores / socket", 4, 256, key="cores", on_change=_cpu_edited)
+            try:
+                ss.ram = int(ss.ram)
+            except (TypeError, ValueError):
+                ss.ram = int(ss.get("_ram_ok") or DEFAULTS["ram"])
+            ss._ram_ok = ss.ram
+            ram_opts = sorted(set(RAM_OPTIONS) | {ss.ram})
+            c[2].selectbox("RAM / host (GB)", ram_opts, key="ram", format_func=_ram_label, accept_new_options=True,
+                           on_change=_ram_entered,
+                           help="Common configurations, multiples of 256 GB up to 4 TB. Type another amount "
+                                f"({RAM_MIN:,}-{RAM_MAX:,} GB) and press Enter to use it.")
+            c[3].number_input("CPU speed (GHz)", 1.0, 5.0, key="clock", format="%.2f", on_change=_cpu_edited,
+                              help="Base clock per core. Used for measured CPU (Live Optics) sizing.")
+            if int(ss.ram) % 256:
+                st.markdown(f":orange-badge[:material/warning: {int(ss.ram):,} GB isn't a multiple of 256 GB] "
+                            "Current servers fill every memory channel evenly; check the DIMM layout supports it.")
+            if cpu:
+                st.caption(f"**{cpu['name']}**: {cpu['cores']} cores per socket, {cpu['ghz']:.2f} GHz base, "
+                           f"up to {cpu['max_sockets']} socket{'' if cpu['max_sockets'] == 1 else 's'}"
+                           + (f" ({cpu['note']})" if cpu["note"] else "") + ".")
+                if ss.sockets > cpu["max_sockets"]:
+                    st.markdown(f":orange-badge[:material/warning: {cpu['name']} supports {cpu['max_sockets']} "
+                                f"socket{'' if cpu['max_sockets'] == 1 else 's'}] Lower Sockets / host or pick another processor.")
             st.segmented_control(
                 "Live Optics basis", ["95th Percentile", "Peak CPU", "Average CPU"], key="lo_basis", width=seg_width(["95th Percentile", "Peak CPU", "Average CPU"]),
                 disabled="LiveOptics" not in ctx["source"],
@@ -3139,7 +3634,7 @@ def host_card(r, which):
                f"{r['growth']*100:.0f}% annual growth.")
         big_value(hosts, "hosts", sub)
         tag = host_label(r, which)[1]
-        badges = [f":blue-badge[N+{r['ha_nodes']}]", f":gray-badge[{cons} constraint]"]
+        badges = [f":blue-badge[N+{r['ha_nodes']}]", f":gray-badge[{constraint_name(cons)} constraint]"]
         if tag:
             badges.append(f":orange-badge[:material/lock: {tag}]")
         st.markdown(" ".join(badges))
@@ -3186,7 +3681,11 @@ def page_recommendation():
         ("Resilience", f"N+{r['ha_nodes']}", f"· {r['hosts_now']} hosts", f"Minimum cluster size {r['min_hosts']}",
          badge_md(d["ha_ok"] and d["min_ok"], "Met", "Not met")),
     ]
-    for col, (label, val, unit, sub, badge) in zip(st.columns(4), cards):
+    if d.get("ghz_use") is not None:
+        cards.insert(3, ("Measured CPU at failover", f"{d['ghz_use']:.0%}", "of usable GHz",
+                         f"{r['perf_ghz']:,.0f} GHz ({r['lo_basis']}) vs {d['usable_ghz']:,.0f} GHz usable",
+                         badge_md(d["ghz_ok"], "Fits", "Short on CPU")))
+    for col, (label, val, unit, sub, badge) in zip(st.columns(len(cards)), cards):
         with col, st.container(border=True, height="stretch"):
             eyebrow(label)
             big_value(val, unit, sub)
@@ -3208,6 +3707,7 @@ def page_recommendation():
         if r["vcpu_ratio"] > r["hv_ratio"] + EPS:
             st.caption(f":red[The design limit ({r['vcpu_ratio']:.1f}:1) is above the {hv_label(r)}, so this headroom "
                        "assumes a denser cluster than the guidance.]")
+
 
     section_title("Side by side", "Current vs. " + ("proposed" if r["override_now"] else "recommended"))
     day1_col = "Proposed (Day 1)" if r["override_now"] else "Recommended (Day 1)"
@@ -3234,7 +3734,7 @@ def page_recommendation():
     with c1, st.container(border=True, height="stretch"):
         st.markdown("#### Target hardware (per node)")
         st.html(kv_html([
-            ("CPU", f"{r['sockets']} socket{'' if r['sockets'] == 1 else 's'} x {r['cores']} cores ({r['host_cores']} cores)", False),
+            ("CPU", f"{host_cpu_text(r)} · {r['host_cores']} cores", False),
             ("RAM", f"{r['ram']:,} GB", False),
             ("Overhead reserved", f"{r['cpu_buffer']}% CPU, {r['ram_buffer']}% RAM", False),
             ("Hypervisor", f"{r['hypervisor']} ({r['hv_ratio']:.1f}:1 {r['hv_kind']})", False),
