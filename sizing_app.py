@@ -33,7 +33,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.12"
+APP_VERSION = "3.13"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds

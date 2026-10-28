@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.12)
+# 📊 Virtualization Sizing Calculator (v3.13)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.12
+**Version:** 3.13
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -112,6 +112,9 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; size all VMs, powered-on only, or powered-off only (DR).
 
 ## 📝 Changelog
+
+**3.13**
+* **Mac launcher works from a downloaded ZIP.** macOS runs apps from a downloaded (quarantined) ZIP from a temporary copy, so *Host Sizing Calculator* couldn't find *Run_on_mac.command* next to it. It now finds the real Host Sizer folder (Spotlight, then Downloads, Desktop, Documents, ~/HostSizer and OneDrive/iCloud folders), starts from there and clears the download's quarantine flag so later starts are normal. If the folder can't be found, it copies the one-command install to the clipboard and explains what to do.
 
 **3.12**
 * Launchers check that the tool files are next to them and explain how to fix it (usually: extract the ZIP first) instead of failing with *"Could not open requirements file"*.

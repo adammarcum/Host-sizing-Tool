@@ -59,22 +59,51 @@
         set myPosixFolder to POSIX path of myFolder
     end tell
     
+    set installCmd to "curl -fsSL https://raw.githubusercontent.com/adammarcum/Host-sizing-Tool/main/install_mac.sh | bash"
+    set fixMsg to "Easiest fix: open Terminal, press Cmd+V to paste the install command (already copied to your clipboard) and press Return. It installs Host Sizer in your home folder and starts it."
+
+    -- macOS runs downloaded (quarantined) apps from a temporary, read-only copy ("App Translocation"),
+    -- so the files next to the app aren't visible. Find the real Host Sizer folder instead; the
+    -- launcher then clears the quarantine flag so the next start is normal.
+    if myPosixFolder contains "/AppTranslocation/" then
+        set foundFolder to ""
+        try
+            set foundFolder to do shell script "/bin/bash -c " &amp; quoted form of "best=\"\"; bestt=0
+while IFS= read -r f; do
+  d=\"${f%/*}\"
+  [ -f \"$d/sizing_app.py\" ] &amp;&amp; [ -d \"$d/Host Sizing Calculator.app\" ] || continue
+  t=$(stat -f %B \"$d/sizing_app.py\" 2&gt;/dev/null || echo 0)
+  xattr -p com.apple.quarantine \"$d/Host Sizing Calculator.app\" &gt;/dev/null 2&gt;&amp;1 &amp;&amp; t=$((t + 4000000000))
+  [ \"$t\" -gt \"$bestt\" ] &amp;&amp; { best=\"$d\"; bestt=$t; }
+done &lt; &lt;( { mdfind 'kMDItemFSName == \"Run_on_mac.command\"' 2&gt;/dev/null; find \"$HOME/Downloads\" \"$HOME/Desktop\" \"$HOME/Documents\" \"$HOME/HostSizer\" \"$HOME/Library/CloudStorage\" -maxdepth 5 -name Run_on_mac.command 2&gt;/dev/null; } | sort -u )
+printf '%s' \"$best\"
+"
+        end try
+        if foundFolder is "" then
+            set the clipboard to installCmd
+            display dialog "macOS opened this app from a temporary copy because the download is quarantined, and the Host Sizer files couldn't be found." &amp; return &amp; return &amp; fixMsg buttons {"OK"} default button "OK" with icon caution
+            return input
+        end if
+        set myPosixFolder to foundFolder &amp; "/"
+    end if
+
     -- The launcher handles Python, libraries, theme and start-up
     try
         do shell script "test -f " &amp; quoted form of (myPosixFolder &amp; "Run_on_mac.command")
     on error
-        display dialog "Run_on_mac.command was not found next to this app. Keep the app in the same folder as the Host Sizer files." buttons {"OK"} default button "OK" with icon caution
+        set the clipboard to installCmd
+        display dialog "Run_on_mac.command was not found next to this app." &amp; return &amp; return &amp; fixMsg buttons {"OK"} default button "OK" with icon caution
         return input
     end try
 
     tell application "Terminal"
         activate
-        -- Run the sizing app using the specific relative path
-        do script "cd " &amp; quoted form of myPosixFolder &amp; " &amp;&amp; bash Run_on_mac.command"
+        do script "cd " &amp; quoted form of myPosixFolder &amp; " &amp;&amp; xattr -dr com.apple.quarantine . 2&gt;/dev/null; bash Run_on_mac.command"
     end tell
     
     return input
-end run</string>
+end run
+</string>
 				</dict>
 				<key>BundleIdentifier</key>
 				<string>com.apple.Automator.RunScript</string>
