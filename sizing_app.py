@@ -44,7 +44,7 @@ ALL_CLUSTERS = "All Clusters"
 LIC_MIN_CORES_PER_SOCKET = 16   # VMware per-core licensing minimum per CPU
 PERF_TARGET_UTIL = 0.80         # Performance sizing keeps hosts at <= 80% CPU
 LO_95TH_FALLBACK = 0.95         # 95th estimate = 95% of peak when column missing
-MIB_PER_TB = 1024 * 1024
+MIB_PER_TB = 1e6 / 1.048576        # binary MiB per decimal TB (reports use decimal TB)
 EPS = 1e-9                      # guards ceil() against float noise (e.g. 3.0000000001)
 
 # Hypervisor vCPU:pCPU guidance: (ratio, "average"/"maximum", source note)
@@ -56,11 +56,36 @@ HYPERVISORS = {
 }
 DEFAULT_HYPERVISOR = "VMware"
 
-RVTOOLS_SHEETS = ["vInfo", "vHost", "vDatastore", "vPartition", "vDisk", "vLicense"]
-LIVEOPTICS_SHEETS = ["VMs", "ESX Hosts", "Host Devices", "ESX Performance", "ESX Licenses"]
+RVTOOLS_SHEETS = ["vInfo", "vHost", "vDatastore", "vPartition", "vDisk", "vLicense", "vSnapshot", "vMemory", "vMetaData", "vMultiPath"]
+LIVEOPTICS_SHEETS = ["VMs", "ESX Hosts", "Host Devices", "ESX Performance", "ESX Licenses", "Host Disks"]
 
 HOST_NAME_COLS = ["Host Name", "Host", "ESX Host", "Hostname", "Server Name"]
 LUN_ID_COLS = ["Canonical Name", "Device ID", "Device UUID", "UUID", "NAA ID", "Device Name"]
+RDM_DISK_COLS = ["VM", "Raw", "Disk", "Label", "Raw LUN ID", "Raw Comp. Mode", "Disk Mode", "Sharing mode",
+                 "Shared Bus", "Controller", "Host", "Cluster"]
+LUN_COLS = ["Host", "Cluster", "Datastore", "Disk", "Display name", "Vendor", "Model", "UUID"]
+
+# ---------- storage consumption (3.13) ----------
+# Exports report binary units (RVTools "MiB"; its older "MB" columns are binary too; Live Optics MiB/GiB).
+# Everything is converted to decimal MB and TB (1 TB = 1,000,000 MB), the units storage arrays are sold in.
+MIB_MB, GIB_MB, TIB_MB = 1.048576, 1073.741824, 1099511.627776
+UNIT_MB = (("MiB", MIB_MB), ("MB", MIB_MB), ("GiB", GIB_MB), ("GB", GIB_MB), ("TiB", TIB_MB), ("TB", TIB_MB))
+SNAP_SHEET = "Snapshots"                 # Live Optics snapshot tab, whatever it is called in the export
+SNAP_VM_COLS = ["VM", "VM Name", "Virtual Machine", "Name"]
+SNAP_DATE_COLS = ["Date / time", "Date/time", "Date / Time", "Created", "Create Time", "Creation Date",
+                  "Creation Time", "Date"]
+SNAP_COLS = SNAP_VM_COLS + SNAP_DATE_COLS + [f"Size {u}{s}" for u, _ in UNIT_MB for s in (" (total)", " (vmsn)", "")] + \
+    [f"Size ({u})" for u, _ in UNIT_MB] + [f"Snapshot Size ({u})" for u, _ in UNIT_MB] + ["Cluster", "Powerstate"]
+EMPTY_STO = {"vm_alloc": 0.0, "vm_inuse": 0.0, "guest": 0.0, "swap": 0.0, "tmpl_cnt": 0, "tmpl_alloc": 0.0,
+             "tmpl_inuse": 0.0, "rdm_cnt": 0, "rdm": 0.0, "snap_mb": 0.0, "snap_cnt": 0, "snap_vms": 0,
+             "ds_cap": 0.0, "ds_used": 0.0, "ds_alloc": 0.0, "other": None, "has_snap": False, "has_swap": False,
+             "snap_dated": False, "snap_ref": None, "notes": [], "vsan_src": False, "vsan_vms": 0,
+             "vsan_vm_alloc": 0.0, "vsan_vm_inuse": 0.0, "vsan_tmpl_alloc": 0.0, "vsan_tmpl_inuse": 0.0,
+             "vsan_ds": 0, "vsan_cap": 0.0, "vsan_used": 0.0, "vsan_raw": 0.0, "vsan_vm_used_logical": 0.0,
+             "vsan_layout": "", "vsan_kind": "", "vsan_vxrail": False, "vsan_copies_in_vm": True,
+             "rdms": None, "host_luns": None}
+
+
 
 
 # =============================================================================
@@ -92,13 +117,8 @@ def first_col(df, candidates):
 
 
 def rvtools_tb(df, base):
-    """RVTools: find '{base} <unit>' and normalise to TB."""
-    for unit, divisor in (("MiB", MIB_PER_TB), ("MB", MIB_PER_TB),
-                          ("GiB", 1024), ("GB", 1024), ("TiB", 1), ("TB", 1)):
-        col = f"{base} {unit}"
-        if col in df.columns:
-            return col_sum(df, col) / divisor
-    return 0.0
+    """RVTools: find '{base} <unit>' and convert to decimal TB."""
+    return mb_sum(df, base) / 1e6
 
 
 def is_true(series):
@@ -188,7 +208,40 @@ def load_workbook(file_bytes):
             df = xls.parse(name)
             df.columns = df.columns.astype(str).str.strip()
             sheets[name] = df
-    return source, sheets
+    if source == "LiveOptics":                 # snapshot tab name varies between Live Optics versions
+        snap = next((n for n in xls.sheet_names if "snapshot" in n.lower()), None)
+        if snap:
+            df = xls.parse(snap)
+            df.columns = df.columns.astype(str).str.strip()
+            sheets[SNAP_SHEET] = df
+    return source, fill_standalone(source, sheets)
+
+
+STANDALONE = "Standalone hosts"
+STANDALONE_SHEETS = {"RVTools": ["vInfo", "vHost", "vMultiPath"],
+                     "LiveOptics": ["VMs", "ESX Hosts", "ESX Performance", "Host Devices"]}
+
+
+def fill_standalone(source, sheets):
+    """VMs and hosts with no cluster (stand-alone ESXi hosts) become one 'Standalone hosts' group, so they
+    can be selected and sized like a cluster instead of being silently left out."""
+    for name in STANDALONE_SHEETS.get(source, []):
+        df = sheets.get(name)
+        if df is None or df.empty:
+            continue
+        if "Cluster" not in df.columns:
+            if name == "Host Devices":       # filtered by host name instead
+                continue
+            df = df.assign(Cluster=STANDALONE)
+        else:
+            blank = df["Cluster"].isna() | df["Cluster"].astype(str).str.strip().isin(["", "nan", "None"])
+            if not blank.any():
+                continue
+            df = df.copy()
+            df["Cluster"] = df["Cluster"].astype(object)
+            df.loc[blank, "Cluster"] = STANDALONE
+        sheets[name] = df
+    return sheets
 
 
 def cluster_list(source, sheets):
@@ -274,7 +327,8 @@ METHOD_STEPS = [
     ("Also shown", "Live Optics performance sizing (80% CPU target), NUMA fit for large VMs, and per-core licensing "
                    "(16-core minimum per CPU)."),
 ]
-METHOD_NOTE = ("This is a planning estimate based on the data provided. Storage, vSAN, GPU and application-specific "
+METHOD_NOTE = ("This is a planning estimate based on the data provided. Storage is reported as consumption and "
+               "effective capacity only; vSAN, array protection and data reduction, GPU and application-specific "
                "requirements are not included and should be confirmed during design.")
 
 
@@ -357,14 +411,18 @@ def _unit_cols(*bases):
 # Keep this in sync with parse_rvtools() / parse_live_optics(); save_project() verifies nothing is lost.
 REQUIRED_COLUMNS = {
     "RVTools": {
-        "vInfo": ["VM", "Powerstate", "Template", "SRM Placeholder", "Cluster", "CPUs", "Memory", "Memory GB"]
+        "vInfo": ["VM", "Powerstate", "Template", "SRM Placeholder", "Cluster", "CPUs", "Memory", "Memory GB", "Path"]
                  + _unit_cols("Provisioned", "In Use"),
         "vHost": ["Host", "Cluster", "# CPU", "Cores per CPU", "# Memory", "CPU Model", "CPU model",
-                  "Speed", "CPU Speed", "Speed MHz", "ESX Version", "Product"],
-        "vDatastore": ["Name", "Cluster name", "Cluster"] + _unit_cols("Capacity", "In Use"),
+                  "Speed", "CPU Speed", "Speed MHz", "ESX Version", "Product", "Vendor", "Model"],
+        "vDatastore": ["Name", "Cluster name", "Cluster", "Type", "# Hosts"] + _unit_cols("Capacity", "In Use", "Provisioned"),
         "vPartition": ["VM"] + _unit_cols("Consumed"),
-        "vDisk": ["VM", "Raw"] + _unit_cols("Capacity"),
+        "vDisk": RDM_DISK_COLS + _unit_cols("Capacity"),
+        "vMultiPath": LUN_COLS,
         "vLicense": ["Name", "Used"],
+        "vSnapshot": SNAP_COLS,
+        "vMemory": ["VM", "Powerstate", "Reservation"] + _unit_cols("Size"),
+        "vMetaData": ["xlsx creation datetime", "Server time", "xlsx creation date"],
     },
     "LiveOptics": {
         "VMs": ["VM Name", "Power State", "Template", "SRM Placeholder", "Cluster", "Virtual CPU",
@@ -372,11 +430,14 @@ REQUIRED_COLUMNS = {
                 "Guest VM Disk Used (MiB)"],
         "ESX Hosts": ["Cluster", "CPU Sockets", "CPU Cores", "Memory (KiB)", "CPU Model", "Processor", "CPU Type",
                       "CPU Description", "CPU Speed (MHz)", "Speed (MHz)", "CPU Clock (MHz)", "CPU Speed (GHz)",
-                      "Speed (GHz)", "ESX Version", "OS Version", "Version", "OS"] + HOST_NAME_COLS,
-        "Host Devices": ["Cluster", "Capacity (GiB)", "Used Capacity (GiB)", "Free Capacity (GiB)"]
-                        + HOST_NAME_COLS + LUN_ID_COLS,
+                      "Speed (GHz)", "CPU Clock Speed (GHz)", "ESX Version", "OS Version", "Version", "OS",
+                      "Manufacturer", "Model"] + HOST_NAME_COLS,
+        "Host Devices": ["Cluster", "Capacity (GiB)", "Used Capacity (GiB)", "Free Capacity (GiB)", "Device Type",
+                         "Vendor", "Model", "VM Count"] + HOST_NAME_COLS + LUN_ID_COLS,
+        "Host Disks": ["Cluster", "Host", "Disk Name", "Disk Capacity (MiB)", "Disk Model", "Disk Vendor", "SSD"],
         "ESX Performance": ["Cluster", "95th Percentile CPU (GHz)", "Peak CPU (GHz)", "Average CPU (GHz)"],
         "ESX Licenses": ["Software Title"],
+        SNAP_SHEET: SNAP_COLS,
     },
 }
 VERIFY_KEYS = ["tot_vms", "tot_vcpu", "tot_ram", "cur_host_count", "cur_cores", "cur_total_ram_gb", "hosts_now",
@@ -551,6 +612,813 @@ def host_cpu_text(r):
     return f"{r['sockets']} socket{'' if r['sockets'] == 1 else 's'} x {r['cores']} cores at {float(r['clock']):.2f} GHz"
 
 
+def unit_mb(df, base):
+    """Per-row decimal MB from a '{base} <unit>' column, or None when the export doesn't have it."""
+    if df is None:
+        return None
+    for unit, f in UNIT_MB:
+        col = f"{base} {unit}"
+        if col in df.columns:
+            return num(df[col]).fillna(0) * f
+    return None
+
+
+def mb_sum(df, base):
+    s = unit_mb(df, base)
+    return float(s.sum()) if s is not None else 0.0
+
+
+def snapshot_size_mb(df):
+    """Per-snapshot size in MB: the 'total' column when there is one (delta disks + memory), else any size column."""
+    cols = list(df.columns)
+    pick = None
+    for pref in ("total", ""):
+        for c in cols:
+            lc = c.lower()
+            if "size" in lc and "vmsn" not in lc and pref in lc and any(u.lower() in lc for u, _ in UNIT_MB):
+                pick = c
+                break
+        if pick:
+            break
+    if not pick:
+        return None
+    f = next(f for u, f in sorted(UNIT_MB, key=lambda x: -len(x[0])) if u.lower() in pick.lower())
+    return num(df[pick]).fillna(0) * f
+
+
+def export_date(sheets):
+    """When the export was taken (RVTools vMetaData), so snapshot ages aren't measured from today."""
+    md = sheets.get("vMetaData")
+    if md is not None and not md.empty:
+        c = first_col(md, ["xlsx creation datetime", "Server time", "xlsx creation date"])
+        if c:
+            d = pd.to_datetime(md[c], errors="coerce").dropna()
+            if not d.empty:
+                return d.iloc[0].to_pydatetime().replace(tzinfo=None)
+    return None
+
+
+def snapshot_frame(sheet, vm_names, ref):
+    """[vm, mb, days] for the snapshots of the VMs in scope."""
+    if sheet is None or sheet.empty:
+        return None
+    vc = first_col(sheet, SNAP_VM_COLS)
+    mb = snapshot_size_mb(sheet)
+    if not vc or mb is None:
+        return None
+    df = pd.DataFrame({"vm": sheet[vc].astype(str), "mb": mb})
+    dc = first_col(sheet, SNAP_DATE_COLS)
+    when = pd.to_datetime(sheet[dc], errors="coerce") if dc else pd.Series(pd.NaT, index=sheet.index)
+    try:
+        when = when.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    df["days"] = (pd.Timestamp(ref or datetime.now()) - when).dt.days
+    return df[df["vm"].isin(vm_names)].reset_index(drop=True)
+
+
+def add_snapshots(sto, snaps, ref):
+    if snaps is None:
+        sto["notes"].append("Snapshot data not in this export (RVTools vSnapshot tab or a Live Optics snapshot tab)")
+        return
+    sto.update(has_snap=True, snap_mb=float(snaps["mb"].sum()), snap_cnt=len(snaps), snap_vms=int(snaps["vm"].nunique()),
+               snap_dated=bool(snaps["days"].notna().any()), snap_ref=ref.strftime("%b %d, %Y") if ref else None)
+
+
+def storage_rvtools(sheets, info_scope, vms_info, clusters, power, ds):
+    """RVTools storage: VM files, snapshots, swap, templates, RDMs, guest used and other datastore files."""
+    sto = copy.deepcopy(EMPTY_STO)
+    names = set(vms_info["VM"].astype(str)) if "VM" in vms_info.columns else set()
+    sto["vm_alloc"], sto["vm_inuse"] = mb_sum(vms_info, "Provisioned"), mb_sum(vms_info, "In Use")
+    if "Template" in info_scope.columns and power == POWER_ALL:   # templates move with the estate
+        t = info_scope[is_true(info_scope["Template"])]
+        sto.update(tmpl_cnt=len(t), tmpl_alloc=mb_sum(t, "Provisioned"), tmpl_inuse=mb_sum(t, "In Use"))
+    part = sheets.get("vPartition")
+    if part is not None and "VM" in part.columns:
+        sto["guest"] = mb_sum(part[part["VM"].astype(str).isin(names)], "Consumed")
+    disk = sheets.get("vDisk")
+    if disk is not None and "Raw" in disk.columns:
+        d = disk[disk["VM"].astype(str).isin(names)] if "VM" in disk.columns else disk
+        rdm = d[is_true(d["Raw"])]
+        sto.update(rdm_cnt=len(rdm), rdm=mb_sum(rdm, "Capacity"))
+    sto["rdms"] = rdm_frame(disk, names)
+    sto["host_luns"] = host_lun_frame(sheets.get("vMultiPath"), clusters, sto["rdms"])
+    mem = sheets.get("vMemory")
+    if mem is not None and "VM" in mem.columns and unit_mb(mem, "Size") is not None:
+        m = mem[mem["VM"].astype(str).isin(names)]
+        if "Powerstate" in m.columns:
+            m = m[m["Powerstate"].astype(str).str.contains("poweredOn", case=False, na=False)]
+        res = num_col(m, "Reservation").fillna(0) * MIB_MB
+        sto.update(swap=float((unit_mb(m, "Size") - res).clip(lower=0).sum()), has_swap=True)
+    # vSAN today: VM usage on vSAN datastores includes the policy's copies (removed in storage_summary)
+    dsall = sheets.get("vDatastore")
+    if ds.get("df") is not None and "Type" in ds["df"].columns:
+        v = ds["df"][ds["df"]["Type"].astype(str).str.contains("vsan", case=False, na=False)]
+        sto.update(vsan_ds=len(v), vsan_cap=mb_sum(v, "Capacity"), vsan_used=mb_sum(v, "In Use"))
+    if dsall is not None and {"Name", "Type"} <= set(dsall.columns):
+        vsan_ds = set(dsall.loc[dsall["Type"].astype(str).str.contains("vsan", case=False, na=False), "Name"].astype(str))
+        if vsan_ds and "Path" in info_scope.columns:
+            home = lambda df: df["Path"].astype(str).str.extract(r"^\[([^\]]+)\]")[0].isin(vsan_ds)  # noqa: E731
+            on_v = vms_info[home(vms_info)]
+            sto.update(vsan_src=bool(len(on_v)) or bool(ds.get("vsan")), vsan_vm_alloc=mb_sum(on_v, "Provisioned"),
+                       vsan_vm_inuse=mb_sum(on_v, "In Use"), vsan_vms=len(on_v))
+            if "Template" in info_scope.columns and power == POWER_ALL:
+                t = info_scope[is_true(info_scope["Template"])]
+                t = t[home(t)]
+                sto.update(vsan_tmpl_alloc=mb_sum(t, "Provisioned"), vsan_tmpl_inuse=mb_sum(t, "In Use"))
+        elif ds.get("vsan"):
+            sto["vsan_src"] = True
+            sto["notes"].append("vSAN datastores found but VM paths aren't in the export, so today's vSAN protection "
+                                "copies can't be removed from VM usage")
+    ref = export_date(sheets)
+    snaps = snapshot_frame(sheets.get("vSnapshot"), names, ref)
+    add_snapshots(sto, snaps, ref)
+    sto["snaps"] = snaps
+    sto.update(ds_cap=ds["cap_mb"], ds_used=ds["used_mb"], ds_alloc=ds["alloc_mb"])
+    if ds["cap_mb"] > 0 and power == POWER_ALL and ds["mapped"]:
+        if ds["vsan"]:
+            sto["notes"].append("Other datastore files not estimated: vSAN datastore usage includes its protection copies")
+        else:
+            sto["other"] = other_files_mb(sheets["vInfo"], ds["df"], ds.get("ccol"), clusters)
+            if sto["other"] is None:
+                sto["notes"].append("Other datastore files not estimated: VM paths (vInfo 'Path') not in export")
+    return sto
+
+
+def other_files_mb(vinfo, dstores, ccol, clusters):
+    """Datastore space not used by any VM or template (ISOs, orphaned and non-VM files). Each VM's usage is
+    attributed to its home datastore (vInfo 'Path'); a datastore shared by several clusters is split evenly so
+    cluster totals don't count it twice."""
+    use = unit_mb(vinfo, "In Use")
+    if "Path" not in vinfo.columns or use is None or "Name" not in dstores.columns:
+        return None
+    home = vinfo["Path"].astype(str).str.extract(r"^\[([^\]]+)\]")[0]
+    by_ds = use.groupby(home).sum()
+    used = unit_mb(dstores, "In Use")
+    if used is None:
+        return None
+    wanted = set(clusters or [])
+    total = 0.0
+    for idx, row in dstores.iterrows():
+        other = max(float(used.loc[idx]) - float(by_ds.get(str(row["Name"]), 0.0)), 0.0)
+        share = 1.0
+        if clusters is not None and ccol:
+            names = [c.strip() for c in str(row[ccol]).split(",") if c.strip()]
+            share = sum(c in wanted for c in names) / len(names) if names else 1.0
+        total += other * share
+    return total
+
+
+BOOT_DISK_WORDS = ("boss", "satadom", "usb", "sd card", "m.2")
+
+
+def lo_vsan(sheets, esx, vms_df):
+    """Live Optics has no datastore type, so vSAN is recognised from the hardware: a shared ('Cluster') datastore
+    whose vendor/model is one of the hosts' local disks, or VxRail hosts."""
+    hc = first_col(esx, HOST_NAME_COLS)
+    hosts = set(esx[hc].astype(str)) if hc else set()
+    vxrail = "Model" in esx.columns and esx["Model"].astype(str).str.contains("vxrail", case=False, na=False).any()
+    disks = sheets.get("Host Disks")
+    local = pd.DataFrame()
+    if disks is not None and {"Host", "Disk Name"} <= set(disks.columns):
+        d = disks[disks["Host"].astype(str).isin(hosts)]
+        model = d["Disk Model"].astype(str) if "Disk Model" in d.columns else pd.Series("", index=d.index)
+        txt = (d["Disk Name"].astype(str) + " " + model).str.lower()
+        local = d[d["Disk Name"].astype(str).str.lower().str.startswith("local")
+                  & ~txt.str.contains("|".join(BOOT_DISK_WORDS), na=False)]
+    dev = sheets.get("Host Devices")
+    found = pd.DataFrame()
+    if dev is not None and {"Device Type", "Vendor", "Model"} <= set(dev.columns):
+        sc = first_col(dev, HOST_NAME_COLS)
+        dv = dev[dev[sc].astype(str).isin(hosts)] if sc else dev
+        shared = dv[dv["Device Type"].astype(str).str.lower() == "cluster"]
+        idc = first_col(shared, LUN_ID_COLS)
+        if idc:
+            shared = shared.drop_duplicates(subset=[idc])
+        if len(local) and {"Disk Vendor", "Disk Model"} <= set(local.columns):
+            pairs = set(zip(local["Disk Vendor"].astype(str).str.lower(), local["Disk Model"].astype(str).str.lower()))
+            found = shared[[(str(v).lower(), str(m).lower()) in pairs for v, m in zip(shared["Vendor"], shared["Model"])]]
+        if found.empty and vxrail and len(shared) == 1:
+            found = shared
+    if found.empty and not vxrail:
+        return {}
+    out = {"vsan_src": True, "vsan_ds": len(found), "vsan_vxrail": bool(vxrail), "vsan_copies_in_vm": False,
+           "vsan_cap": col_sum(found, "Capacity (GiB)") * GIB_MB, "vsan_used": col_sum(found, "Used Capacity (GiB)") * GIB_MB}
+    names = set(found[first_col(found, LUN_ID_COLS)].astype(str)) if len(found) and first_col(found, LUN_ID_COLS) else set()
+    if "Datastore" in vms_df.columns and names:
+        on = vms_df[vms_df["Datastore"].astype(str).isin(names)]
+        out["vsan_vms"] = len(on)
+        out["vsan_vm_used_logical"] = col_sum(on, "Virtual Disk Used (MiB)") * MIB_MB
+    if len(local) and "Disk Capacity (MiB)" in local.columns:
+        n_hosts = max(local["Host"].nunique(), 1)
+        tiers = (local.assign(tb=(num(local["Disk Capacity (MiB)"]) * MIB_MB / 1e6).round(2))
+                 .groupby(["tb", local.get("Disk Model", pd.Series("", index=local.index)).astype(str)]).size())
+        parts = [f"{cnt / n_hosts:g} x {tb:g} TB {model}".strip() for (tb, model), cnt in tiers.sort_index(ascending=False).items()]
+        out["vsan_layout"] = f"{n_hosts} hosts, per host: " + ", ".join(parts)
+        out["vsan_kind"] = ("OSA with cache and capacity tiers" if len(tiers) == 2 and tiers.index.get_level_values(0).min()
+                            < tiers.index.get_level_values(0).max() / 4 else "single tier (ESA, or OSA all-flash)")
+        out["vsan_raw"] = float((num(local["Disk Capacity (MiB)"]) * MIB_MB).sum())
+    return out
+
+
+def storage_liveoptics(sheets, vm_scope, vms_df, power, esx=None):
+    sto = copy.deepcopy(EMPTY_STO)
+    mib = lambda df, c: col_sum(df, c) * MIB_MB  # noqa: E731
+    vc = "VM Name" if "VM Name" in vms_df.columns else None
+    names = set(vms_df[vc].astype(str)) if vc else set()
+    sto.update(vm_alloc=mib(vms_df, "Virtual Disk Size (MiB)"), vm_inuse=mib(vms_df, "Virtual Disk Used (MiB)"),
+               guest=mib(vms_df, "Guest VM Disk Used (MiB)"))
+    if "Template" in vm_scope.columns and power == POWER_ALL:
+        t = vm_scope[is_true(vm_scope["Template"])]
+        sto.update(tmpl_cnt=len(t), tmpl_alloc=mib(t, "Virtual Disk Size (MiB)"), tmpl_inuse=mib(t, "Virtual Disk Used (MiB)"))
+    snaps = snapshot_frame(sheets.get(SNAP_SHEET), names, None)
+    add_snapshots(sto, snaps, None)
+    if snaps is not None and len(snaps):
+        sto["notes"].append("Live Optics snapshot ages are measured from today, not the capture date")
+    sto["snaps"] = snaps
+    sto["notes"].append("Live Optics: other datastore files can't be separated from LUN-level capacity")
+    if esx is not None and not esx.empty:
+        sto.update(lo_vsan(sheets, esx, vms_df))
+    return sto
+
+
+def combine_storage(stos):
+    out = copy.deepcopy(EMPTY_STO)
+    for s in stos:
+        for k, v in s.items():
+            if k in ("notes", "snaps", "snap_ref", "other", "has_snap", "has_swap", "snap_dated", "vsan_src",
+                     "rdms", "host_luns", "vsan_layout", "vsan_kind", "vsan_vxrail", "vsan_copies_in_vm"):
+                continue
+            out[k] += v
+    others = [s["other"] for s in stos if s.get("other") is not None]
+    out["other"] = sum(others) if others else None
+    out["has_snap"] = any(s["has_snap"] for s in stos)
+    out["has_swap"] = any(s["has_swap"] for s in stos)
+    out["vsan_src"] = any(s.get("vsan_src") for s in stos)
+    out["vsan_vxrail"] = any(s.get("vsan_vxrail") for s in stos)
+    out["vsan_copies_in_vm"] = any(s.get("vsan_copies_in_vm") and s.get("vsan_src") for s in stos)
+    out["vsan_layout"] = " | ".join(dict.fromkeys(s["vsan_layout"] for s in stos if s.get("vsan_layout")))
+    out["vsan_kind"] = " | ".join(dict.fromkeys(s["vsan_kind"] for s in stos if s.get("vsan_kind")))
+    out["snap_dated"] = any(s["snap_dated"] for s in stos)
+    out["snap_ref"] = next((s["snap_ref"] for s in stos if s.get("snap_ref")), None)
+    out["notes"] = list(dict.fromkeys(n for s in stos for n in s["notes"]))
+    for k in ("rdms", "host_luns"):
+        fr = [s[k] for s in stos if s.get(k) is not None]
+        out[k] = pd.concat(fr, ignore_index=True) if fr else None
+    frames = [s["snaps"] for s in stos if s.get("snaps") is not None]
+    out["snaps"] = pd.concat(frames, ignore_index=True) if frames else None
+    return out
+
+
+def storage_summary(sto, p, mult):
+    """Consumption totals and the effective capacity to buy: consumed x growth / (1 - free-space target)."""
+    s = {k: v for k, v in sto.items() if k != "snaps"}
+    old_days = int(p.get("snap_old_days") or DEFAULTS["snap_old_days"])
+    free = min(max(float(p.get("sto_free_pct", DEFAULTS["sto_free_pct"])), 0.0), 90.0) / 100
+    snaps = sto.get("snaps")
+    old = snaps[snaps["days"] > old_days] if snaps is not None and len(snaps) else None
+    s.update(old_days=old_days, free_pct=free * 100, mult=mult,
+             snap_old_cnt=len(old) if old is not None else 0,
+             snap_old_mb=float(old["mb"].sum()) if old is not None else 0.0,
+             snap_oldest=int(snaps["days"].max()) if snaps is not None and snaps["days"].notna().any() else None)
+    if s.get("vsan_src") and s.get("vsan_copies_in_vm"):   # RVTools: VM usage on vSAN includes protection copies
+        f = VSAN_SRC_POLICIES.get(VSAN_SRC_LEGACY.get(p.get("vsan_src_policy"), p.get("vsan_src_policy")), 2.0)
+        cut = 1 - 1 / f
+        s["vsan_removed"] = (s["vsan_vm_inuse"] + s["vsan_tmpl_inuse"]) * cut
+        for k in ("vm_alloc", "vm_inuse", "tmpl_alloc", "tmpl_inuse"):
+            s[k] -= s[f"vsan_{k}"] * cut
+    other = s["other"] or 0.0
+    snap, snap_old = s["snap_mb"], s["snap_old_mb"]
+    tot = {"inuse": s["vm_inuse"] + s["tmpl_inuse"] + s["rdm"] + other,
+           "alloc": s["vm_alloc"] + s["tmpl_alloc"] + s["rdm"] + other}
+    s["totals"] = {b: {"with": v, "no_old": max(v - snap_old, 0.0), "without": max(v - snap, 0.0)} for b, v in tot.items()}
+    s["required"] = {b: {k: (v / (1 - free), v * mult / (1 - free)) for k, v in row.items()}
+                     for b, row in s["totals"].items()}
+    return s
+
+
+def fmt_cap(mb):
+    """Decimal TB (2 decimals); MB only for amounts under 0.01 TB."""
+    if mb is None:
+        return "n/a"
+    return f"{mb / 1e6:,.2f} TB" if abs(mb) >= 1e4 or mb == 0 else f"{mb:,.0f} MB"
+
+
+STO_COLS = [("with", "With all snapshots"), ("no_old", "Without old snapshots"), ("without", "Without snapshots")]
+
+
+def storage_tables_html(r, table_class="compare", hl_class="hl"):
+    """Consumption and effective-capacity tables, shared by the app and the reports."""
+    s = r["sto"]
+    e = lambda v: escape(str(v))  # noqa: E731
+    snap_old = f"older than {s['old_days']} days"
+    snaps = s["has_snap"] and s["snap_cnt"] > 0
+    rows = [(f"Virtual machines ({r['tot_vms']:,})", s["vm_alloc"] - s["snap_mb"], s["vm_inuse"] - s["snap_mb"], "")]
+    if snaps:
+        rows.append((f"Snapshots ({s['snap_cnt']:,})", s["snap_mb"], s["snap_mb"], ""))
+        if s["snap_dated"] and s["snap_old_cnt"]:
+            rows.append((f"&nbsp;&nbsp;of which {snap_old} ({s['snap_old_cnt']:,})", s["snap_old_mb"], s["snap_old_mb"], "sub"))
+    if s["tmpl_cnt"]:
+        rows.append((f"Templates ({s['tmpl_cnt']:,})", s["tmpl_alloc"], s["tmpl_inuse"], ""))
+    if s["rdm_cnt"]:
+        rows.append((f"RDM disks ({s['rdm_cnt']:,})", s["rdm"], s["rdm"], ""))
+    if s["other"]:
+        rows.append(("Other datastore files (ISOs and non-VM files, estimate)", None, s["other"], ""))
+    body = ""
+    for label, a, u, cls in rows:
+        lab = label if label.startswith("&nbsp;") else e(label)
+        tr = "<tr class='sub'>" if cls else "<tr>"
+        body += (f"{tr}<td>{lab}</td><td>{fmt_cap(a) if a is not None else '-'}</td>"
+                 f"<td>{fmt_cap(u) if u is not None else 'n/a'}</td></tr>")
+    t = s["totals"]
+    body += (f"<tr class='total'><td>Total{' with snapshots' if snaps else ''}</td><td>{fmt_cap(t['alloc']['with'])}</td>"
+             f"<td class='{hl_class}'>{fmt_cap(t['inuse']['with'])}</td></tr>")
+    if snaps:
+        body += (f"<tr class='total'><td>Total without snapshots</td><td>{fmt_cap(t['alloc']['without'])}</td>"
+                 f"<td>{fmt_cap(t['inuse']['without'])}</td></tr>")
+    consumed = (f"<table class='{table_class}'><tr><th>Consumed today</th><th>Allocated (provisioned)</th>"
+                f"<th>In use</th></tr>{body}</table>")
+    req = s["required"]
+    cols = [c for c in STO_COLS if snaps and (c[0] != "no_old" or s["snap_old_cnt"])] or [("with", "Required")]
+    rbody = ""
+    for b, name in (("inuse", "In use"), ("alloc", "Allocated")):
+        for i, when in ((0, "Day 1"), (1, f"Future · {r['years']} yr")):
+            cells = ""
+            for k, _ in cols:
+                td = f"<td class='{hl_class}'>" if (b, i, k) == ("inuse", 1, "with") else "<td>"
+                cells += f"{td}{fmt_cap(req[b][k][i])}</td>"
+            rbody += f"<tr><td>{name} · {when}</td>{cells}</tr>"
+    heads = "".join(f"<th>{e(f'Without snapshots {snap_old}' if k == 'no_old' else h)}</th>" for k, h in cols)
+    required = f"<table class='{table_class}'><tr><th>Effective capacity required</th>{heads}</tr>{rbody}</table>"
+    return consumed, required
+
+
+def storage_facts(r):
+    """Reference figures shown under the tables: (label, value)."""
+    s = r["sto"]
+    out = [("Used inside the guest operating systems", fmt_cap(s["guest"]))]
+    if s["has_swap"]:
+        out.append(("VM swap files (powered-on VMs, memory minus reservation; part of VM in use)", fmt_cap(s["swap"])))
+    if s["has_snap"]:
+        out.append(("Oldest snapshot", f"{s['snap_oldest']:,} days" if s["snap_oldest"] is not None else "date not in export"))
+    if not s["has_snap"]:
+        out.append(("Snapshots", "Not in this export"))
+    if s.get("vsan_layout"):
+        out.append((f"Current vSAN drives ({s.get('vsan_kind')})", s["vsan_layout"]))
+    if s.get("vsan_src") and s.get("vsan_copies_in_vm"):
+        out.append((f"vSAN today: protection copies removed from {s['vsan_vms']:,} VMs ({src_policy_label(r)})",
+                    fmt_cap(s.get("vsan_removed", 0.0))))
+    out.append(("Growth and free space", f"{r['growth'] * 100:.0f}% a year for {r['years']} years (x{s['mult']:.2f}); "
+                                         f"{s['free_pct']:.0f}% kept free"))
+    return out
+
+
+# ---------- vSAN ESA host storage estimate (3.13) ----------
+# Model calibrated to Broadcom's vSAN ReadyNode Sizer (ESA, all flash): 6 hosts x 12 x 1.6 TB, RAID-6,
+# Operations Reserve on, compression 1.2 -> 51.87 TB usable. Planning estimate only; confirm in the sizer.
+VSAN_DRIVES_TB = [1.6, 1.92, 3.2, 3.84, 6.4, 7.68, 12.8, 15.36]
+VSAN_MIN_DRIVES = 2
+VSAN_FIXED = [("Fixed metadata overhead", 0.10), ("File system overhead", 0.05), ("Performance tier overhead", 0.05)]
+VSAN_OBJECT_OVERHEAD = 0.131     # object/namespace overhead as a share of space left after reserves
+VSAN_OR_RAW_FACTOR = 1.10        # Operations Reserve is usable space; raw = OR x protection x 1.10
+VSAN_RESERVE_CAP = 0.30          # reserves capped below 30% of capacity for small clusters
+VSAN_POLICIES = {                # name: (capacity multiplier, minimum hosts)
+    "RAID-1 (FTT=1)": (2.0, 2),
+    "RAID-5 (FTT=1, 2+1)": (1.5, 3),
+    "RAID-5 (FTT=1, 4+1)": (1.25, 6),
+    "RAID-6 (FTT=2, 4+2)": (1.5, 6),
+}                                # vSAN ESA policies only (OSA isn't modelled for new clusters)
+VSAN_AUTO = "Auto (by host count)"
+VSAN_PICK_AUTO = "Closest fit (automatic)"
+# Today's vSAN policy, used only to back the protection copies out of RVTools VM usage (the source cluster
+# may be OSA or ESA). Multiplier = raw space per GB of VM data.
+VSAN_SRC_POLICIES = {
+    "RAID-1 mirror, FTT=1 (OSA or ESA) · 2x": 2.0,
+    "RAID-5 3+1, FTT=1 (OSA) · 1.33x": 4 / 3,
+    "RAID-5 2+1, FTT=1 (ESA, 3-5 hosts) · 1.5x": 1.5,
+    "RAID-5 4+1, FTT=1 (ESA, 6+ hosts) · 1.25x": 1.25,
+    "RAID-6 4+2, FTT=2 (OSA or ESA) · 1.5x": 1.5,
+    "RAID-1 mirror, FTT=2 · 3x": 3.0,
+    "No adjustment (use VM usage as reported) · 1x": 1.0,
+}
+VSAN_SRC_LEGACY = {"RAID-1 (FTT=1) · 2x": "RAID-1 mirror, FTT=1 (OSA or ESA) · 2x",
+                   "RAID-5 · 1.33x": "RAID-5 3+1, FTT=1 (OSA) · 1.33x",
+                   "RAID-5 (ESA 2+1) · 1.5x": "RAID-5 2+1, FTT=1 (ESA, 3-5 hosts) · 1.5x",
+                   "RAID-6 · 1.5x": "RAID-6 4+2, FTT=2 (OSA or ESA) · 1.5x",
+                   "RAID-1 (FTT=2) · 3x": "RAID-1 mirror, FTT=2 · 3x",
+                   "Already excludes copies · 1x": "No adjustment (use VM usage as reported) · 1x"}
+
+
+def vsan_policy(hosts, choice=VSAN_AUTO):
+    """Protection by cluster size: 2 hosts RAID-1, 3-5 RAID-5, 6+ RAID-6 (unless a policy is chosen)."""
+    if choice in VSAN_POLICIES:
+        return choice
+    if hosts <= 2:
+        return "RAID-1 (FTT=1)"
+    return "RAID-5 (FTT=1, 2+1)" if hosts <= 5 else "RAID-6 (FTT=2, 4+2)"
+
+
+def vsan_capacity(hosts, drives, size_tb, policy, compression=1.0):
+    """Capacity breakdown in TB for one host configuration. Operations Reserve from 3 hosts, Host Rebuild
+    Reserve (one host's share, N+1) from 4 hosts; neither applies to 2-host clusters."""
+    mult = VSAN_POLICIES[policy][0]
+    raw = hosts * drives * size_tb
+    parts = [(name, raw * pct) for name, pct in VSAN_FIXED]
+    after = raw - sum(v for _, v in parts)
+    gb = size_tb * 1000
+    or_on, hrr_on = hosts >= 3, hosts >= 4
+    op = ((hosts * 765 + hosts * drives * (min(gb * 0.05, 100) + min(gb * 0.0025, 100))) / 1000
+          * mult * VSAN_OR_RAW_FACTOR) if or_on else 0.0
+    hrr = after / hosts if hrr_on else 0.0
+    if hrr_on and op + hrr > after * VSAN_RESERVE_CAP:
+        hrr = max(after * VSAN_RESERVE_CAP - op, 0.0)
+    left = max(after - op - hrr, 0.0)
+    obj = left * VSAN_OBJECT_OVERHEAD
+    data = left - obj
+    usable = data / mult
+    return {"hosts": hosts, "drives": drives, "size": size_tb, "policy": policy, "mult": mult, "raw": raw,
+            "parts": parts, "op": op, "hrr": hrr, "or_on": or_on, "hrr_on": hrr_on, "obj": obj,
+            "raid": data - usable, "usable": usable, "compression": compression, "effective": usable * compression}
+
+
+def vsan_fit(hosts, target_tb, size_tb, policy, compression, max_drives):
+    """Fewest drives per host of one size that reach the target, or None when even max_drives is short."""
+    for n in range(VSAN_MIN_DRIVES, int(max_drives) + 1):
+        c = vsan_capacity(hosts, n, size_tb, policy, compression)
+        if c["effective"] >= target_tb - 1e-9:
+            return c
+    return None
+
+
+def vsan_estimate(r):
+    """Drive options for the Day 1 host count holding the future need (plus Day 1 need and future hosts)."""
+    s = r["sto"]
+    hosts, fut_hosts = int(r["hosts_now"]), int(r["hosts_fut"])
+    comp = max(float(r.get("vsan_compression") or 1.0), 1.0)
+    max_d = int(r.get("vsan_max_drives") or DEFAULTS["vsan_max_drives"])
+    choice = r.get("vsan_raid") or VSAN_AUTO
+    policy, fut_policy = vsan_policy(hosts, choice), vsan_policy(fut_hosts, choice)
+    if VSAN_POLICIES[policy][1] > hosts:
+        return {"error": f"{policy} needs at least {VSAN_POLICIES[policy][1]} hosts; the cluster has {hosts}."}
+    if hosts < 2:
+        return {"error": "vSAN needs at least 2 hosts."}
+    # Reserves give vSAN its slack, so the target is consumption x growth without the free-space target;
+    # 2-host clusters have no reserves, so they keep the free-space target.
+    free = 0.0 if hosts >= 3 else s["free_pct"] / 100
+    base = s["totals"]["inuse"]["with"] / 1e6
+    tgt_fut, tgt_now = base * s["mult"] / (1 - free), base / (1 - free)
+    fut_free = 0.0 if fut_hosts >= 3 else s["free_pct"] / 100
+    tgt_fut_hosts = base * s["mult"] / (1 - fut_free)
+    rows = []
+    for size in VSAN_DRIVES_TB:
+        rows.append({"size": size, "fit": vsan_fit(hosts, tgt_fut, size, policy, comp, max_d),
+                     "now": vsan_fit(hosts, tgt_now, size, policy, comp, max_d),
+                     "fut_hosts": vsan_fit(fut_hosts, tgt_fut_hosts, size, fut_policy, comp, max_d)
+                     if VSAN_POLICIES[fut_policy][1] <= fut_hosts else None})
+    fits = [x for x in rows if x["fit"]]
+    best = min(fits, key=lambda x: (x["fit"]["raw"], x["fit"]["drives"])) if fits else None
+    fewest = min(fits, key=lambda x: (x["fit"]["drives"], x["fit"]["raw"])) if fits else None
+    return {"hosts": hosts, "fut_hosts": fut_hosts, "policy": policy, "fut_policy": fut_policy, "compression": comp,
+            "max_drives": max_d, "target_fut": tgt_fut, "target_now": tgt_now, "target_fut_hosts": tgt_fut_hosts,
+            "free_used": free, "rows": rows, "best": best, "fewest": fewest,
+            "chosen": next((x for x in fits if vsan_pick_label(x) == r.get("vsan_pick")), best),
+            "picked": any(vsan_pick_label(x) == r.get("vsan_pick") for x in fits)}
+
+
+def vsan_pick_label(row):
+    """Saved choice for one drive option: the drive size (so it survives changes in drive count)."""
+    return f"{row['size']:g} TB"
+
+
+def vsan_pick_text(v, value):
+    row = next((x for x in v.get("rows", []) if x["fit"] and vsan_pick_label(x) == value), None)
+    if row:
+        return f"{row['fit']['drives']} x {row['size']:g} TB per host"
+    b = v.get("best")
+    return f"{VSAN_PICK_AUTO} · {b['fit']['drives']} x {b['size']:g} TB" if b else VSAN_PICK_AUTO
+
+
+def vsan_pick_options(v):
+    return [VSAN_PICK_AUTO] + [vsan_pick_label(x) for x in v.get("rows", []) if x["fit"]]
+
+
+def vsan_tables_html(r, v, table_class="compare sto", hl_class="hl"):
+    """Drive options table and the capacity breakdown of the closest fit (shared by app and reports)."""
+    e = lambda x: escape(str(x))  # noqa: E731
+    tb = lambda x: f"{x:,.2f} TB"  # noqa: E731
+    body = ""
+    for row in v["rows"]:
+        f = row["fit"]
+        tags = []
+        if v["chosen"] is row:
+            tags.append("In report")
+        if v["best"] is row:
+            tags.append("Closest fit")
+        if v["fewest"] is row and v["fewest"] is not v["best"]:
+            tags.append("Fewest drives")
+        tag = "".join(f" <span class='tag mini'>{e(t)}</span>" for t in tags)
+        cell = lambda c: f"{c['drives']}" if c else f"&gt; {v['max_drives']}"  # noqa: E731
+        hl = f" class='{hl_class}'" if v["chosen"] is row else ""
+        body += (f"<tr><td>{row['size']:g} TB NVMe{tag}</td><td{hl}>{cell(f)}</td>"
+                 f"<td>{tb(f['raw']) if f else '-'}</td><td>{tb(f['effective']) if f else '-'}</td>"
+                 f"<td>{cell(row['now'])}</td><td>{cell(row['fut_hosts']) if v['fut_policy'] else '-'}</td></tr>")
+    options = (f"<table class='{table_class}'><tr><th>Drive</th><th>Per host</th><th>Raw</th><th>Effective</th>"
+               f"<th>Day 1 need</th><th>{v['fut_hosts']} hosts</th></tr>{body}</table>")
+    if not v["chosen"]:
+        return options, ""
+    c = v["chosen"]["fit"]
+    rows = [("Raw capacity", c["raw"])] + c["parts"]
+    rows += [("Operations reserve", c["op"]) if c["or_on"] else ("Operations reserve (not on 2-host clusters)", 0.0),
+             ("Host rebuild reserve (N+1)", c["hrr"]) if c["hrr_on"] else ("Host rebuild reserve (needs 4+ hosts)", 0.0),
+             ("Object overhead", c["obj"]), (f"Protection overhead · {c['policy']}", c["raid"]),
+             ("Usable capacity", c["usable"])]
+    if c["compression"] > 1:
+        rows.append((f"Effective with {c['compression']:.2f}x compression", c["effective"]))
+    bd = ""
+    for i, (k, val) in enumerate(rows):
+        tr = "<tr class='total'>" if i in (0, len(rows) - 1) else "<tr>"
+        bd += f"{tr}<td>{e(k)}</td><td>{tb(val)}</td><td>{val / c['raw']:.0%}</td></tr>"
+    breakdown = (f"<table class='{table_class}'><tr><th>{c['hosts']} hosts x {c['drives']} x "
+                 f"{c['size']:g} TB</th><th>Capacity</th><th>Share of raw</th></tr>{bd}</table>")
+    return options, breakdown
+
+
+def src_policy_label(r):
+    v = r.get("vsan_src_policy")
+    return VSAN_SRC_LEGACY.get(v, v)
+
+
+def vsan_detect_text(r):
+    s = r["sto"]
+    n = s.get("vsan_ds", 0)
+    bits = [f"{n} datastore{'s' if n != 1 else ''}" if n else "VxRail hosts"]
+    if s.get("vsan_cap"):
+        bits.append(f"{fmt_cap(s['vsan_cap'])} capacity, {fmt_cap(s.get('vsan_used', 0))} used")
+    if s.get("vsan_vms"):
+        bits.append(f"{s['vsan_vms']:,} VMs")
+    text = "vSAN" + (" (VxRail)" if s.get("vsan_vxrail") else "") + " in the current environment: " + ", ".join(bits) + "."
+    logical = s.get("vsan_vm_used_logical") or 0
+    if logical and s.get("vsan_used"):
+        ratio = s["vsan_used"] / logical
+        hint = "RAID-1 mirroring" if ratio >= 1.8 else ("RAID-5/6" if ratio >= 1.15 else "little protection overhead")
+        text += f" Datastore used is {ratio:.1f}x the VMs' data, consistent with {hint}."
+    if s.get("vsan_copies_in_vm"):
+        text += f" VM usage is counted without today's protection copies ({src_policy_label(r)})."
+    return text
+
+
+def vsan_options_note(v):
+    return (f"Per host: capacity drives per host on {v['hosts']} hosts for the future need, with the raw and effective "
+            f"capacity that gives. Day 1 need: drives for today's requirement. {v['fut_hosts']} hosts: drives if the "
+            "cluster grows to the future host count. Closest fit = least raw capacity that meets the need.")
+
+
+def vsan_lede(r, v):
+    if v.get("error"):
+        return v["error"]
+    src = (" The current environment runs on vSAN: VM usage there includes today's protection copies, which are "
+           f"removed using the '{src_policy_label(r)}' assumption."
+           if r["sto"].get("vsan_src") and r["sto"].get("vsan_copies_in_vm") else
+           (" The current environment runs on vSAN; Live Optics VM usage already excludes its protection copies."
+            if r["sto"].get("vsan_src") else ""))
+    best = v["chosen"]
+    fit = (f"The proposed configuration is {best['fit']['drives']} x {best['size']:g} TB NVMe capacity drives per host "
+           f"({best['fit']['effective']:,.2f} TB effective)." if best else
+           f"No single drive size reaches it within {v['max_drives']} drives per host; add hosts or raise the limit.")
+    return (f"{v['hosts']} vSAN ESA hosts with {v['policy']} need {v['target_fut']:,.2f} TB of effective capacity for the "
+            f"future workload (in use with snapshots, {r['years']} years of growth"
+            + (f", {v['free_used'] * 100:.0f}% free" if v["free_used"] else ", reserves instead of a free-space target")
+            + f"). {fit}{src}")
+
+
+VSAN_NOTE = ("vSAN ESA estimate, all flash: 20% fixed overhead (metadata 10%, file system 5%, performance tier 5%), "
+             "Broadcom's ESA Operations Reserve formula (3+ hosts), Host Rebuild Reserve of one host's share (4+ hosts, "
+             "reserves capped at 30%), about 13% object overhead, then the protection policy and compression. "
+             "Policy by host count: 2 hosts RAID-1, 3-5 RAID-5 (2+1), 6+ RAID-6 (4+2). Calibrated to the vSAN "
+             "ReadyNode Sizer; confirm the final design there.")
+
+
+def vsan_section_html(r, cls=""):
+    e = lambda x: escape(str(x))  # noqa: E731
+    v = r["vsan"]
+    head = f"""
+<section{f' class="{cls}"' if cls else ''} id="vsan"><div class="wrap">
+  <div class="eyebrow">If storage moves to vSAN</div>
+  <h2>vSAN Host Storage</h2>
+  <p class="section-lede">{e(vsan_lede(r, v))}</p>"""
+    if v.get("error"):
+        return head + "</div></section>"
+    best = v["chosen"]
+    _, breakdown = vsan_tables_html(r, v)
+    cards = f"""
+  <div class="cards">
+    <div class="card navy"><div class="label">Cluster</div><div class="big">{v['hosts']} <small>hosts</small></div>
+      <p>{e(v['policy'])}, vSAN ESA all flash.</p></div>
+    <div class="card"><div class="label">Effective needed</div><div class="big">{v['target_fut']:,.2f} <small>TB</small></div>
+      <p>Future need. Day 1: {v['target_now']:,.2f} TB.</p></div>
+    <div class="card green"><div class="label">Capacity drives per host</div><div class="big">{f"{best['fit']['drives']} x {best['size']:g} <small>TB</small>" if best else 'None'}</div>
+      <p>{f"{best['fit']['effective']:,.2f} TB effective from {best['fit']['raw']:,.2f} TB raw." if best else 'Add hosts or drives.'}</p></div>
+  </div>"""
+    return (head + cards + f"""
+  {f'<h3>Capacity breakdown</h3><div class="table-card scroll">{breakdown}</div>' if breakdown else ''}
+  <div class="note"><strong>Basis.</strong> {e(VSAN_NOTE)} Compression {v['compression']:.2f}x; up to {v['max_drives']} drives per host.</div>
+</div></section>""")
+
+
+# ---------- raw device mappings (3.13) ----------
+LOCAL_LUN_WORDS = ("local", "usb", "boot", "cd-rom", "cdrom")
+
+
+def rdm_frame(disk, names):
+    """RDM disks of the VMs in scope: [VM, Disk, Size (MB), Mode, Sharing, LUN ID, Host, Cluster]."""
+    if disk is None or "Raw" not in disk.columns:
+        return None
+    d = disk[is_true(disk["Raw"])]
+    if "VM" in d.columns:
+        d = d[d["VM"].astype(str).isin(names)]
+    txt = lambda c: d[c].astype(str).replace({"nan": "", "None": ""}) if c in d.columns else pd.Series("", index=d.index)  # noqa: E731
+    mode = txt("Raw Comp. Mode").str.replace("Mode", "", case=False).str.strip().str.capitalize()
+    share = txt("Sharing mode")
+    bus = txt("Shared Bus")
+    sharing = share.where(~share.str.lower().isin(["", "sharingnone", "nosharing"]), "")
+    sharing = sharing.where(sharing != "", bus.where(~bus.str.lower().isin(["", "nosharing", "none"]), ""))
+    nice = {"sharingmultiwriter": "Multi-writer", "physicalsharing": "SCSI bus (physical)",
+            "virtualsharing": "SCSI bus (virtual)"}
+    sharing = sharing.map(lambda v: nice.get(v.lower(), v))
+    size = unit_mb(d, "Capacity")
+    return pd.DataFrame({
+        "VM": txt("VM"), "Disk": txt("Label").where(txt("Label") != "", txt("Disk")),
+        "Size (MB)": size if size is not None else 0.0, "Mode": mode.replace("", "Unknown"),
+        "Sharing": sharing.replace("", "None"), "LUN ID": txt("Raw LUN ID"), "Host": txt("Host"),
+        "Cluster": txt("Cluster")}).reset_index(drop=True)
+
+
+def host_lun_frame(mp, clusters, rdms):
+    """LUNs presented to hosts that aren't datastores (RVTools vMultiPath): RDM candidates or unused LUNs."""
+    if mp is None or mp.empty or "Datastore" not in mp.columns:
+        return None
+    m = filter_clusters(mp, clusters)
+    ds = m["Datastore"].astype(str).str.strip()
+    m = m[m["Datastore"].isna() | ds.isin(["", "nan", "None"])]
+    key = first_col(m, ["Disk", "UUID", "Display name"])
+    if not key or m.empty:
+        return pd.DataFrame(columns=["LUN", "Name", "Hosts", "Used as RDM by"])
+    name = m["Display name"].astype(str) if "Display name" in m.columns else m[key].astype(str)
+    m = m[~name.str.lower().str.contains("|".join(LOCAL_LUN_WORDS), na=False)]
+    if m.empty:
+        return pd.DataFrame(columns=["LUN", "Name", "Hosts", "Used as RDM by"])
+    host = m["Host"].astype(str) if "Host" in m.columns else pd.Series("", index=m.index)
+    ids = rdms["LUN ID"].astype(str).str.lower().tolist() if rdms is not None and len(rdms) else []
+    vms = rdms["VM"].tolist() if rdms is not None and len(rdms) else []
+    rows = []
+    for lun, grp in m.groupby(m[key].astype(str)):
+        hexid = re.sub(r"^(naa|eui|t10|mpx)\.", "", lun.lower())
+        users = sorted({vm for vm, i in zip(vms, ids) if hexid and len(hexid) >= 8 and hexid in i})
+        rows.append({"LUN": lun, "Name": str(name.loc[grp.index[0]]), "Hosts": int(host.loc[grp.index].nunique()),
+                     "Used as RDM by": ", ".join(users) if users else "Not matched to an RDM in scope"})
+    return pd.DataFrame(rows)
+
+
+def rdm_summary(s):
+    rd = s.get("rdms")
+    n = len(rd) if rd is not None else 0
+    phys = int((rd["Mode"].str.lower() == "physical").sum()) if n else 0
+    shared = int((rd["Sharing"] != "None").sum()) if n else 0
+    luns = s.get("host_luns")
+    unmatched = int((luns["Used as RDM by"] == "Not matched to an RDM in scope").sum()) if luns is not None and len(luns) else 0
+    return {"count": n, "vms": int(rd["VM"].nunique()) if n else 0, "physical": phys, "virtual": n - phys if n else 0,
+            "shared": shared, "mb": float(rd["Size (MB)"].sum()) if n else 0.0,
+            "luns": len(luns) if luns is not None else None, "luns_unmatched": unmatched}
+
+
+def rdm_flag_text(r):
+    x = r["rdm"]
+    if not x["count"] and not x["luns_unmatched"]:
+        return None
+    parts = []
+    if x["count"]:
+        parts.append(f"{x['count']} RDM disk{'s' if x['count'] != 1 else ''} on {x['vms']} VM{'s' if x['vms'] != 1 else ''} "
+                     f"({fmt_cap(x['mb'])}; {x['physical']} physical mode, {x['virtual']} virtual"
+                     + (f"; {x['shared']} shared, e.g. Windows failover clusters" if x["shared"] else "") + ")")
+    if x["luns_unmatched"]:
+        one = x["luns_unmatched"] == 1
+        parts.append(f"{x['luns_unmatched']} host LUN{'' if one else 's'} that {'is' if one else 'are'} not "
+                     "a datastore or a matched RDM")
+    return "; ".join(parts) + ". Plan how these move: physical-mode and shared RDMs can't be Storage vMotioned or converted in place."
+
+
+def rdm_tables_html(r, table_class="compare sto", limit=200):
+    e = lambda v: escape(str(v))  # noqa: E731
+    s = r["sto"]
+    out = []
+    rd = s.get("rdms")
+    if rd is not None and len(rd):
+        body = "".join(f"<tr><td>{e(x['VM'])}</td><td>{e(x['Disk'])}</td><td>{fmt_cap(x['Size (MB)'])}</td>"
+                       f"<td>{e(x['Mode'])}</td><td>{e(x['Sharing'])}</td><td>{e(x['Host'])}</td></tr>"
+                       for _, x in rd.head(limit).iterrows())
+        more = f"<tr><td colspan='6'>+ {len(rd) - limit:,} more in the app's Raw Data</td></tr>" if len(rd) > limit else ""
+        out.append(f"<table class='{table_class}'><tr><th>VM</th><th>Disk</th><th>Size</th><th>Compatibility</th>"
+                   f"<th>Sharing</th><th>Host</th></tr>{body}{more}</table>")
+    luns = s.get("host_luns")
+    if luns is not None and len(luns):
+        body = "".join(f"<tr><td>{e(x['Name'])}</td><td>{e(x['LUN'])}</td><td>{x['Hosts']}</td><td>{e(x['Used as RDM by'])}</td></tr>"
+                       for _, x in luns.head(limit).iterrows())
+        out.append(f"<table class='{table_class}'><tr><th>Host LUN (not a datastore)</th><th>Device</th><th>Hosts</th>"
+                   f"<th>Used as RDM by</th></tr>{body}</table>")
+    return out
+
+
+def rdm_section_html(r, cls=""):
+    e = lambda v: escape(str(v))  # noqa: E731
+    x = r["rdm"]
+    tables = rdm_tables_html(r)
+    lede = rdm_flag_text(r) or ("No raw device mappings were found for the VMs in scope"
+                                + ("" if x["luns"] is not None else " (host LUN data, RVTools vMultiPath, isn't in the export)")
+                                + ".")
+    cards = (f"""
+  <div class="cards">
+    <div class="card navy"><div class="label">RDM disks</div><div class="big">{x['count']:,}</div><p>On {x['vms']:,} VM{'' if x['vms'] == 1 else 's'} · {e(fmt_cap(x['mb']))}.</p></div>
+    <div class="card"><div class="label">Physical / virtual mode</div><div class="big">{x['physical']:,} <small>/ {x['virtual']:,}</small></div>
+      <p>{x['shared']:,} shared (multi-writer or SCSI bus sharing).</p></div>
+    <div class="card"><div class="label">Host LUNs not datastores</div><div class="big">{x['luns'] if x['luns'] is not None else 'n/a'}</div>
+      <p>{x['luns_unmatched']:,} not matched to an RDM in scope.</p></div>
+  </div>""")
+    body = "".join(f'<div class="table-card scroll" style="margin-top:20px">{t}</div>' for t in tables)
+    return f"""
+<section{f' class="{cls}"' if cls else ''} id="rdm"><div class="wrap">
+  <div class="eyebrow">Migration check</div>
+  <h2>Raw Device Mappings</h2>
+  <p class="section-lede">{e(lede)}</p>{cards}{body}
+  <div class="note"><strong>Why it matters.</strong> {e(RDM_NOTE)}</div>
+</div></section>"""
+
+
+RDM_NOTE = ("RDMs map a SAN LUN straight to a VM. Virtual-mode RDMs can be converted to VMDKs during Storage vMotion; "
+            "physical-mode and shared RDMs (Windows failover clusters, Oracle RAC) stay on the array and must be re-zoned "
+            "and re-presented to the new hosts, or migrated inside the guest. Host LUNs that aren't datastores may be RDMs "
+            "of VMs outside this scope, or unused. Sources: RVTools vDisk (RDMs) and vMultiPath (host LUNs).")
+
+
+def cap_big(mb):
+    """'1.23 <small>TB</small>' for report cards."""
+    num_, unit = fmt_cap(mb).split(" ")
+    return f"{num_} <small>{unit}</small>"
+
+
+def storage_lede(r):
+    s = r["sto"]
+    t = s["totals"]["inuse"]
+    snap = (f" Snapshots hold {fmt_cap(s['snap_mb'])} across {s['snap_cnt']:,} snapshots"
+            + (f", {fmt_cap(s['snap_old_mb'])} of it older than {s['old_days']} days" if s["snap_old_cnt"] else "") + "."
+            if s["has_snap"] and s["snap_cnt"] else (" No snapshots were found." if s["has_snap"] else
+                                                     " Snapshot data isn't in this export."))
+    parts = ["VMs"] + (["templates"] if s["tmpl_cnt"] else []) + (["RDM disks"] if s["rdm_cnt"] else []) + \
+        (["other datastore files"] if s["other"] else [])
+    what = ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else parts[0]
+    return (f"{what[0].upper() + what[1:]} occupy {fmt_cap(t['with'])} today "
+            f"({fmt_cap(s['totals']['alloc']['with'])} allocated).{snap} Planning for {r['years']} years of growth with "
+            f"{s['free_pct']:.0f}% kept free needs about {fmt_cap(s['required']['inuse']['with'][1])} of effective capacity.")
+
+
+def storage_section_html(r, cls=""):
+    e = lambda v: escape(str(v))  # noqa: E731
+    s = r["sto"]
+    consumed, required = storage_tables_html(r, table_class="compare sto")
+    facts = "".join(f"<tr><td>{e(k)}</td><td>{e(v)}</td></tr>" for k, v in storage_facts(r))
+    notes = "".join(f" {e(n)}." for n in s["notes"])
+    old = (f"<span class='pill warn'>{s['snap_old_cnt']:,} older than {s['old_days']} days</span>" if s["snap_old_cnt"]
+           else "<span class='pill ok'>None older than {} days</span>".format(s["old_days"]) if s["snap_cnt"] else "")
+    snap_p = (f"{s['snap_cnt']:,} snapshot{'' if s['snap_cnt'] == 1 else 's'} on {s['snap_vms']:,} "
+              f"VM{'' if s['snap_vms'] == 1 else 's'}." if s["has_snap"] else "Not in this export.")
+    req = s["required"]["inuse"]
+    snaps = s["has_snap"] and s["snap_cnt"] > 0
+    return f"""
+<section{f' class="{cls}"' if cls else ''} id="storage"><div class="wrap">
+  <div class="eyebrow">What the data occupies</div>
+  <h2>Storage Consumption</h2>
+  <p class="section-lede">{e(storage_lede(r))}</p>
+  <div class="cards">
+    <div class="card navy"><div class="label">In use today</div><div class="big">{cap_big(s['totals']['inuse']['with'])}</div>
+      <p>{e(f"Without snapshots: {fmt_cap(s['totals']['inuse']['without'])}." if snaps else "What the VMs and templates occupy on the datastores.")}</p></div>
+    {f'<div class="card"><div class="label">Snapshots</div><div class="big">{cap_big(s["snap_mb"])}</div><p>{e(snap_p)}</p>{old}</div>' if snaps else
+     f'<div class="card"><div class="label">Allocated</div><div class="big">{cap_big(s["totals"]["alloc"]["with"])}</div><p>Full provisioned size of every disk.{" Snapshot data isn&#39;t in this export." if not s["has_snap"] else ""}</p></div>'}
+    <div class="card green"><div class="label">Effective capacity · {r['years']} years</div><div class="big">{cap_big(req['with'][1])}</div>
+      <p>{e(f"In use, {r['growth'] * 100:.0f}% growth a year, {s['free_pct']:.0f}% free. Day 1: {fmt_cap(req['with'][0])}." + (f" Without snapshots: {fmt_cap(req['without'][1])}." if snaps else ""))}</p></div>
+  </div>
+  <div class="table-card scroll">{consumed}</div>
+  <h3>Effective capacity required</h3>
+  <div class="table-card scroll">{required}</div>
+  <div class="card" style="margin-top:20px"><table class="kv">{facts}</table></div>
+  <div class="note"><strong>Basis.</strong> {e(STORAGE_NOTE)}{notes}</div>
+</div></section>"""
+
+
+STORAGE_NOTE = ("Effective capacity = consumed x growth / (1 - free-space target): the usable capacity to plan for "
+                "before any array data reduction, and without vSAN or RAID protection overhead. In use is what VMs "
+                "occupy on the datastores today (thin disks, swap, logs and snapshots); allocated is the full "
+                "provisioned size of every disk. Units are decimal (1 TB = 1,000,000 MB).")
+
+
 # =============================================================================
 # 4. PARSERS
 # Each parser returns the same "inventory" dict:
@@ -560,9 +1428,29 @@ def host_cpu_text(r):
 #   has_perf, perf_ghz, perf_estimated, lic_edition, esxi_version
 #   raw_vms, raw_hosts (original rows in scope, for the Raw Data tab)
 # =============================================================================
+BOOT_DS_PATTERN = r"local|boot|service-datastore|scratch|osdata|^datastore\s*\d*(?:\s*\(\d+\))?$"
+
+
+def drop_boot_datastores(dsdf, vinfo):
+    """Remove ESXi boot / local datastores (single-host or boot-style names such as 'datastore1',
+    '*-service-datastore1', 'local'), unless a VM or template lives on them (stand-alone hosts keep theirs).
+    Returns (datastores kept, number removed)."""
+    if "Name" not in dsdf.columns:
+        return dsdf, 0
+    names = dsdf["Name"].astype(str)
+    bootish = names.str.strip().str.lower().str.contains(BOOT_DS_PATTERN, regex=True, na=False)
+    if "# Hosts" in dsdf.columns:
+        bootish |= num(dsdf["# Hosts"]).fillna(2) <= 1
+    homes = set()
+    if vinfo is not None and "Path" in vinfo.columns:
+        homes = set(vinfo["Path"].astype(str).str.extract(r"^\[([^\]]+)\]")[0].dropna())
+    drop = bootish & ~names.isin(homes)
+    return dsdf[~drop], int(drop.sum())
+
+
 def parse_rvtools(sheets, clusters, power=POWER_ALL):
-    info = drop_templates(sheets["vInfo"])
-    info = filter_clusters(info, clusters)
+    info_scope = filter_clusters(sheets["vInfo"], clusters)
+    info = drop_templates(info_scope)
     vm_on, vm_off = power_counts(info, "Powerstate")
     power = power if power in POWER_MODES else (POWER_ALL if power else POWER_ON)
     info = filter_power(info, "Powerstate", power)
@@ -603,23 +1491,28 @@ def parse_rvtools(sheets, clusters, power=POWER_ALL):
 
     # Datastores (shared, non-local)
     storage = empty_storage("Datastore data not found")
+    ds = {"cap_mb": 0.0, "used_mb": 0.0, "alloc_mb": 0.0, "mapped": False, "vsan": False}
     dsdf = sheets.get("vDatastore")
     if dsdf is not None and not dsdf.empty:
-        d = dsdf
-        if "Name" in d.columns:
-            d = d[~d["Name"].astype(str).str.contains("local", case=False, na=False)]
-        note = "All shared datastores"
+        d, boot = drop_boot_datastores(dsdf, sheets["vInfo"])
+        note = "Shared datastores"
         if clusters is not None:
             ccol = first_col(d, ["Cluster name", "Cluster"])
             if ccol:
                 wanted = set(clusters)
                 d = d[d[ccol].astype(str).apply(
                     lambda s: any(c.strip() in wanted for c in s.split(",")))]
-                note = "Filtered to selected clusters"
+                note = "Datastores of the selected clusters"
             else:
-                note = "Global - datastores not mapped to clusters"
+                note = "All datastores (not mapped to clusters in this export)"
         cap, used = rvtools_tb(d, "Capacity"), rvtools_tb(d, "In Use")
+        if boot:
+            note += ", ESXi boot volumes excluded"
         storage = {"cap": cap, "used": used, "free": cap - used, "note": note}
+        ds.update(cap_mb=mb_sum(d, "Capacity"), used_mb=mb_sum(d, "In Use"), alloc_mb=mb_sum(d, "Provisioned"),
+                  mapped=clusters is None or note.startswith("Datastores of the selected"), df=d,
+                  ccol=first_col(d, ["Cluster name", "Cluster"]) if clusters is not None else None,
+                  vsan="Type" in d.columns and d["Type"].astype(str).str.contains("vsan", case=False).any())
 
     vm_names = set(vms["name"])
 
@@ -638,6 +1531,7 @@ def parse_rvtools(sheets, clusters, power=POWER_ALL):
 
     return {
         "vms": vms, "hosts": hosts, "storage": storage,
+        "sto": storage_rvtools(sheets, info_scope, info, clusters, power, ds),
         "vm_prov_tb": rvtools_tb(info, "Provisioned"),
         "vm_used_tb": rvtools_tb(info, "In Use"),
         "guest_used_tb": guest_used_tb, "rdm_cnt": rdm_cnt, "rdm_tb": rdm_tb,
@@ -649,8 +1543,8 @@ def parse_rvtools(sheets, clusters, power=POWER_ALL):
 
 
 def parse_live_optics(sheets, clusters, power, basis):
-    vm = drop_templates(sheets["VMs"])
-    vm = filter_clusters(vm, clusters)
+    vm_scope = filter_clusters(sheets["VMs"], clusters)
+    vm = drop_templates(vm_scope)
     vm_on, vm_off = power_counts(vm, "Power State")
     power = power if power in POWER_MODES else (POWER_ALL if power else POWER_ON)
     vm = filter_power(vm, "Power State", power)
@@ -667,7 +1561,7 @@ def parse_live_optics(sheets, clusters, power, basis):
         "cores": num_col(esx, "CPU Cores"),
         "ram_gb": num_col(esx, "Memory (KiB)") / 1024 / 1024,
         "model": text_col(esx, ["CPU Model", "Processor", "CPU Type", "CPU Description"]),
-        "ghz": cpu_ghz(esx, ["CPU Speed (MHz)", "Speed (MHz)", "CPU Clock (MHz)"], ["CPU Speed (GHz)", "Speed (GHz)"]),
+        "ghz": cpu_ghz(esx, ["CPU Speed (MHz)", "Speed (MHz)", "CPU Clock (MHz)"], ["CPU Speed (GHz)", "Speed (GHz)", "CPU Clock Speed (GHz)"]),
     }, index=esx.index)
 
     ver_col = first_col(esx, ["ESX Version", "OS Version", "Version", "OS"])
@@ -687,17 +1581,23 @@ def parse_live_optics(sheets, clusters, power, basis):
                     d = d[d[hc_dev].astype(str).isin(esx[hc_esx].astype(str))]
                 else:
                     notes.append("not filtered by cluster")
+        if "Device Type" in d.columns:          # local boot/service datastores, unless VMs run on them
+            local = d["Device Type"].astype(str).str.lower().eq("local")
+            vms_on = num_col(d, "VM Count").fillna(0) > 0
+            dropped = int((local & ~vms_on).sum())
+            d = d[~local | vms_on]
+            if dropped:
+                notes.append("ESXi boot volumes excluded")
         id_col = first_col(d, LUN_ID_COLS)
         if id_col:
             d = d.drop_duplicates(subset=[id_col])
-            notes.insert(0, f"LUNs de-duplicated by '{id_col}'")
         else:
             notes.insert(0, "shared LUNs may be counted once per host")
         storage = {
-            "cap": col_sum(d, "Capacity (GiB)") / 1024,
-            "used": col_sum(d, "Used Capacity (GiB)") / 1024,
-            "free": col_sum(d, "Free Capacity (GiB)") / 1024,
-            "note": "Host Devices - " + "; ".join(notes),
+            "cap": col_sum(d, "Capacity (GiB)") * GIB_MB / 1e6,
+            "used": col_sum(d, "Used Capacity (GiB)") * GIB_MB / 1e6,
+            "free": col_sum(d, "Free Capacity (GiB)") * GIB_MB / 1e6,
+            "note": ", ".join(["Shared datastores"] + notes),
         }
 
     # Performance
@@ -724,6 +1624,8 @@ def parse_live_optics(sheets, clusters, power, basis):
 
     return {
         "vms": vms, "hosts": hosts, "storage": storage,
+        "sto": {**storage_liveoptics(sheets, vm_scope, vm, power, esx),
+                "ds_cap": storage["cap"] * 1e6, "ds_used": storage["used"] * 1e6},
         "vm_prov_tb": col_sum(vm, "Virtual Disk Size (MiB)") / MIB_PER_TB,
         "vm_used_tb": col_sum(vm, "Virtual Disk Used (MiB)") / MIB_PER_TB,
         "guest_used_tb": col_sum(vm, "Guest VM Disk Used (MiB)") / MIB_PER_TB,
@@ -853,6 +1755,7 @@ def compute_sizing(inv, p):
                                   "has_perf", "perf_ghz", "perf_estimated", "lic_edition", "esxi_version",
                                   "vm_on", "vm_off")})
     r["storage"] = inv["storage"]
+    r["sto"] = storage_summary(inv.get("sto") or copy.deepcopy(EMPTY_STO), p, (1 + p["growth"]) ** p["years"])
     r["perf_paired"] = inv.get("perf_paired", [])
     hv = p.get("hypervisor") or DEFAULT_HYPERVISOR
     r["hypervisor"] = hv
@@ -931,6 +1834,8 @@ def compute_sizing(inv, p):
     # Licensing
     r["fut_lic_cores"] = r["hosts_fut"] * license_cores_per_host(p["sockets"], p["cores"])
     r["lic_diff"] = r["fut_lic_cores"] - r["cur_lic_cores"]
+    r["vsan"] = vsan_estimate(r)
+    r["rdm"] = rdm_summary(r["sto"])
     return r
 
 
@@ -1084,6 +1989,10 @@ h3 { font-size: 13px; letter-spacing: .22em; text-transform: uppercase; color: v
 .compare tr:last-child td { border-bottom: 0; }
 .compare td:first-child { color: var(--navy); font-weight: 500; }
 .compare td.hl { background: rgba(0,159,220,.07); color: var(--navy); font-weight: 600; }
+.compare tr.total td { font-weight: 600; color: var(--navy); background: rgba(18,58,97,.05); }
+.compare tr.sub td { font-size: 13px; }
+.compare.sto td:not(:first-child) { white-space: nowrap; }
+.compare .tag.mini { font-size: 10.5px; padding: 2px 8px; margin: 0 0 0 6px; vertical-align: middle; }
 .note { background: rgba(0,159,220,.07); border: 1px solid rgba(0,159,220,.25); border-radius: 12px; padding: 14px 18px; font-size: 14px; line-height: 1.6; color: var(--navy); margin-top: 24px; }
 .logic { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.75; color: var(--gray); }
 
@@ -1219,26 +2128,22 @@ def current_env(r):
         ("Licensed cores (current)", f"{r['cur_lic_cores']:,}", False),
         ("License edition", r["lic_edition"], False),
     ]
-    sto = r["storage"]
-    storage = [
-        ("VMDK provisioned", f"{r['vm_prov_tb']:,.1f} TB", False),
-        ("VMDK in use", f"{r['vm_used_tb']:,.1f} TB", False),
-        ("Guest OS used (backup scope)", f"{r['guest_used_tb']:,.1f} TB", False),
-    ]
-    if r["rdm_cnt"]:
-        storage.append(("RDM disks", f"{r['rdm_cnt']} ({r['rdm_tb']:,.1f} TB)", False))
+    sto, st_ = r["storage"], r["sto"]
+    storage = []                       # datastore view; VM-level storage is under Storage consumption
     if sto["cap"] > 0:
         storage += [
-            ("Datastore capacity", f"{sto['cap']:,.1f} TB", False),
-            ("Datastore used / free", f"{sto['used']:,.1f} TB / {sto['free']:,.1f} TB "
-                                      f"({_pct(sto['used'] / sto['cap'])} used)", False),
+            ("Capacity", fmt_cap(sto["cap"] * 1e6), False),
+            ("Used", f"{fmt_cap(sto['used'] * 1e6)} ({_pct(sto['used'] / sto['cap'])})", False),
+            ("Free", fmt_cap(sto["free"] * 1e6), False),
         ]
     else:
         storage.append(("Datastores", "Not in source file", False))
-    storage.append(("Storage scope", sto["note"], False))
+    storage.append(("vSAN", ("Yes" + (" (VxRail)" if st_.get("vsan_vxrail") else "")) if st_.get("vsan_src") else "No", False))
+    storage.append(("RDM disks", f"{r['rdm_cnt']:,}" if r["rdm_cnt"] else "None", bool(r["rdm_cnt"])))
+    storage.append(("Scope", sto["note"], False))
 
     groups = [("Host Inventory", hosts), ("VM Workload", vms),
-              ("Density & Utilization", density), ("Storage", storage)]
+              ("Density & Utilization", density), ("Datastores", storage)]
     return headline, groups
 
 
@@ -1447,6 +2352,15 @@ def generate_html_report(r, customer_logo_uri=None):
   </div>
 </section>"""
 
+    extra = [rdm_section_html(r)]
+    if r["hypervisor"] == "VMware" and r.get("vsan_show"):
+        extra.append(vsan_section_html(r))
+    if perf_html:
+        extra.append(perf_html)
+    extra = [x.replace("<section id=", f'<section class="{"alt" if i % 2 == 0 else ""}" id=', 1) if i % 2 == 0 else x
+             for i, x in enumerate(extra)]
+    extra_html = "\n".join(extra)
+    method_cls = "alt" if len(extra) % 2 == 0 else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1465,6 +2379,9 @@ def generate_html_report(r, customer_logo_uri=None):
   <a class="link" href="#recommendation">Recommendation</a>
   <a class="link" href="#architecture">NUMA</a>
   <a class="link" href="#licensing">Licensing</a>
+  <a class="link" href="#storage">Storage</a>
+  <a class="link" href="#rdm">RDMs</a>
+  {'<a class="link" href="#vsan">vSAN</a>' if r['hypervisor'] == 'VMware' and r.get('vsan_show') else ''}
   {perf_nav}
   <button class="btn" onclick="window.print()">Print / Save PDF</button>
 </div></nav>
@@ -1534,8 +2451,9 @@ def generate_html_report(r, customer_logo_uri=None):
       {pill(r['lic_diff'] <= 0, "Fewer cores to license" if r['lic_diff'] < 0 else ("No change" if r['lic_diff'] == 0 else "More cores to license"), None if r['lic_diff'] <= 0 else "info")}</div>
   </div>
 </div></section>
-{perf_html}
-{method_section_html([r], "alt" if not perf_html else "")}
+{storage_section_html(r)}
+{extra_html}
+{method_section_html([r], method_cls)}
 <footer><div class="wrap">
   {f'<img src="{ahead_white}" alt="AHEAD">' if ahead_white else '<strong>AHEAD</strong>'}
   <span>Confidential - Proprietary to AHEAD · Prepared for {e(r['customer'])}</span>
@@ -1602,6 +2520,10 @@ def report_flags(r):
         where = ", ".join(RATIO_CELL_NAMES[c] for c in sorted(cells))
         out.append(("Above guidance", f"vCPU:pCPU above the {hv_label(r)} ({where})."))
     out += [("NUMA", t) for bad, t in numa_messages(r) if bad]
+    if r.get("rdm") and rdm_flag_text(r):
+        out.append(("RDM", rdm_flag_text(r)))
+    if r["sto"].get("vsan_src"):
+        out.append(("vSAN", vsan_detect_text(r)))
     return out
 
 
@@ -1637,8 +2559,11 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
     vcpu, vram, fvcpu, fvram = (sum(r[k] for r in R) for k in ("tot_vcpu", "tot_ram", "fut_vcpu", "fut_ram"))
     vms = sum(r["tot_vms"] for r in R)
     cur_l, d1_l, fu_l = sum(r["cur_lic_cores"] for r in R), sum(r["hosts_now"] * lic_host(r) for r in R), sum(r["fut_lic_cores"] for r in R)
-    prov, inuse = sum(r["vm_prov_tb"] for r in R), sum(r["vm_used_tb"] for r in R)
-    dscap, dsused = sum(r["storage"]["cap"] for r in R), sum(r["storage"]["used"] for r in R)
+    S = [r["sto"] for r in R]
+    tsum = lambda b, k: sum(x["totals"][b][k] for x in S)  # noqa: E731
+    rsum = lambda b, k, i: sum(x["required"][b][k][i] for x in S)  # noqa: E731
+    snap_mb, snap_n = sum(x["snap_mb"] for x in S), sum(x["snap_cnt"] for x in S)
+    snap_old_mb, snap_old_n = sum(x["snap_old_mb"] for x in S), sum(x["snap_old_cnt"] for x in S)
     hvs = sorted({r["hypervisor"] for r in R})
     flagged = [c for c in clusters if c["flags"]]
     n_flags = sum(len(c["flags"]) for c in clusters)
@@ -1646,6 +2571,42 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
 
     def go(it, text=None):
         return f"<a href='#{it['tab']}' onclick=\"showTab('{it['tab']}');return false;\">{e(text or it['label'])}</a>"
+
+    sto_rows = "".join(
+        f"<tr><td>{go(c)}</td><td>{fmt_cap(x['totals']['alloc']['with'])}</td><td>{fmt_cap(x['totals']['inuse']['with'])}</td>"
+        f"<td>{fmt_cap(x['snap_mb']) if x['has_snap'] else 'n/a'}</td><td>{fmt_cap(x['snap_old_mb']) if x['has_snap'] else 'n/a'}</td>"
+        f"<td>{fmt_cap(x['required']['inuse']['with'][0])}</td><td class='hl'>{fmt_cap(x['required']['inuse']['with'][1])}</td>"
+        f"<td>{fmt_cap(x['required']['inuse']['without'][1])}</td></tr>"
+        for c, x in zip(clusters, S))
+    sto_rows += (f"<tr class='total'><td>Total</td><td>{fmt_cap(tsum('alloc', 'with'))}</td><td>{fmt_cap(tsum('inuse', 'with'))}</td>"
+                 f"<td>{fmt_cap(snap_mb)}</td><td>{fmt_cap(snap_old_mb)}</td><td>{fmt_cap(rsum('inuse', 'with', 0))}</td>"
+                 f"<td class='hl'>{fmt_cap(rsum('inuse', 'with', 1))}</td><td>{fmt_cap(rsum('inuse', 'without', 1))}</td></tr>")
+    vs_rows = ""
+    for c in clusters:
+        v = c["r"].get("vsan") or {}
+        if c["r"]["hypervisor"] != "VMware" or not v or not c["r"].get("vsan_show"):
+            continue
+        b = v.get("chosen")
+        vs_rows += (f"<tr><td>{go(c)}</td><td>{v.get('hosts', '-')}</td><td>{e(v.get('policy', v.get('error', '')))}</td>"
+                    + (f"<td>{v['target_fut']:,.2f} TB</td><td class='hl'>"
+                       + (f"{b['fit']['drives']} x {b['size']:g} TB</td><td>{b['fit']['effective']:,.2f} TB</td>"
+                          f"<td>{b['fit']['raw']:,.2f} TB</td>" if b else "None</td><td>-</td><td>-</td>")
+                       if not v.get("error") else "<td>-</td><td>-</td><td>-</td><td>-</td>") + "</tr>")
+    vsan_html = (f"<h3>vSAN ESA estimate</h3><div class='table-card scroll'><table class='compare sto'><tr><th>Cluster</th>"
+                 "<th>Hosts</th><th>Policy</th><th>Effective needed</th><th>Drives per host</th><th>Effective</th>"
+                 f"<th>Raw</th></tr>{vs_rows}</table></div>" if vs_rows else "")
+    rd_rows = "".join(
+        f"<tr><td>{go(c)}</td><td>{c['r']['rdm']['count']:,}</td><td>{c['r']['rdm']['physical']:,} / {c['r']['rdm']['virtual']:,}</td>"
+        f"<td>{c['r']['rdm']['shared']:,}</td><td>{fmt_cap(c['r']['rdm']['mb'])}</td>"
+        f"<td>{c['r']['rdm']['luns'] if c['r']['rdm']['luns'] is not None else 'n/a'}</td>"
+        f"<td>{'Yes' if c['r']['sto'].get('vsan_src') else 'No'}</td></tr>"
+        for c in clusters)
+    rdm_html = ("<h3>Raw device mappings and vSAN</h3><div class='table-card scroll'><table class='compare sto'><tr>"
+                "<th>Cluster</th><th>RDM disks</th><th>Physical / virtual</th><th>Shared</th><th>RDM size</th>"
+                f"<th>Host LUNs not datastores</th><th>vSAN today</th></tr>{rd_rows}</table></div>")
+    sto_html = ("<table class='compare sto'><tr><th>Cluster</th><th>Allocated</th><th>In use</th><th>Snapshots</th>"
+                "<th>Old snapshots</th><th>Required Day 1</th><th>Required future</th><th>Future without snapshots</th></tr>"
+                + sto_rows + "</table>")
 
     # ---- Summary: hero ----
     stats = [(plural(d1_h, "host"), f"Day 1 across {nlabel} (today {f0(cur_h)})"),
@@ -1745,19 +2706,27 @@ def generate_consolidated_report(items, customer, customer_logo_uri=None):
 </div></section>
 <section><div class="wrap">
   <div class="eyebrow">Licensing &amp; storage</div><h2>Roll-up</h2>
+  <p class="section-lede">Per-core licensing and storage consumption across {e(nlabel)}, today and after the refresh.</p>
   <div class="cards">
     <div class="card navy"><div class="label">Licensed cores today</div><div class="big">{f0(cur_l)}</div><p>Across {plural(cur_h, 'current host')}.</p></div>
     <div class="card"><div class="label">Licensed cores Day 1</div><div class="big">{f0(d1_l)}</div><p>Future: {f0(fu_l)} cores.</p></div>
     <div class="card {'green' if d1_l <= cur_l else ''}"><div class="label">Net change Day 1</div><div class="big">{d1_l - cur_l:+,}</div>
       <span class='pill {'ok' if d1_l <= cur_l else 'info'}'>{'Fewer or same cores' if d1_l <= cur_l else 'More cores to license'}</span></div>
   </div>
-  <div class="cards" style="margin-top:20px">
-    <div class="card"><div class="label">VMDK provisioned</div><div class="big">{prov:,.1f} <small>TB</small></div><p>In use: {inuse:,.1f} TB.</p></div>
-    <div class="card"><div class="label">Datastore capacity</div><div class="big">{dscap:,.1f} <small>TB</small></div><p>Used: {dsused:,.1f} TB ({pct(dsused, dscap)}).</p></div>
-    <div class="card green"><div class="label">Headroom</div><div class="big">{dscap - dsused:,.1f} <small>TB</small></div><p>Free datastore capacity.</p></div>
+  <h3>Storage</h3>
+  <div class="cards">
+    <div class="card navy"><div class="label">In use today</div><div class="big">{cap_big(tsum('inuse', 'with'))}</div>
+      <p>Allocated: {fmt_cap(tsum('alloc', 'with'))}. Without snapshots: {fmt_cap(tsum('inuse', 'without'))}.</p></div>
+    <div class="card"><div class="label">Snapshots</div><div class="big">{cap_big(snap_mb)}</div>
+      <p>{snap_n:,} snapshots; {snap_old_n:,} older than the age limit ({fmt_cap(snap_old_mb)}).</p></div>
+    <div class="card green"><div class="label">Effective capacity required</div><div class="big">{cap_big(rsum('inuse', 'with', 1))}</div>
+      <p>Future, in use with snapshots, per-cluster growth and free space. Without snapshots: {fmt_cap(rsum('inuse', 'without', 1))}.</p></div>
   </div>
-  <div class="note"><strong>Note:</strong> shared datastores can appear in more than one cluster, so the datastore total may count some
-    capacity twice. VMDK totals are per VM and don't overlap.</div>
+  <div class="table-card scroll" style="margin-top:20px">{sto_html}</div>
+  <div class="note"><strong>Basis.</strong> {e(STORAGE_NOTE)} Each cluster uses its own growth, free-space target and
+    snapshot age limit; datastores shared by several clusters are split between them, so the totals don't count them twice.</div>
+  {rdm_html}
+  {vsan_html}
 </div></section>
 <section class="alt"><div class="wrap">
   <div class="eyebrow">Risks &amp; flags</div><h2>What needs attention</h2>
@@ -1880,6 +2849,11 @@ APP_CSS = """<style>
 .hs-cmp tr:last-child td { border-bottom: 0; }
 .hs-cmp td:first-child { color: #123A61; font-weight: 500; }
 .hs-cmp td.hs-hl { background: rgba(0,159,220,.07); color: #123A61; font-weight: 600; }
+.hs-cmp tr.total td { font-weight: 600; color: #123A61; background: rgba(18,58,97,.05); }
+.hs-cmp tr.sub td { font-size: 13px; }
+.hs-cmp.sto td:not(:first-child), .hs-cmp.sto th:not(:first-child) { white-space: nowrap; }
+.hs-cmp .tag.mini { display: inline-block; font-size: 10.5px; font-weight: 600; color: #009FDC; background: rgba(0,159,220,.12);
+                    border-radius: 9999px; padding: 2px 8px; margin-left: 6px; vertical-align: middle; }
 .hs-tile-name { font-size: 15px; font-weight: 600; color: #123A61; word-break: break-all; }
 </style>"""
 
@@ -1890,12 +2864,14 @@ DEFAULTS = {
     "hypervisor": DEFAULT_HYPERVISOR, "vcpu_ratio": HYPERVISORS[DEFAULT_HYPERVISOR][0], "cpu_buffer": 10, "ram_buffer": 10, "min_hosts": 2, "ha_nodes": 1,
     "override": False, "override_hosts": 4, "override_future": True,
     "include_off": True, "power_scope": POWER_ALL, "growth_pct": 10.0, "years": 3,
-    "customer": "My Customer", "scope": [], "cpu_model": CPU_CUSTOM,
+    "customer": "My Customer", "scope": [], "cpu_model": CPU_CUSTOM, "sto_free_pct": 20.0, "snap_old_days": 30,
+    "vsan_show": False, "vsan_pick": "Closest fit (automatic)", "vsan_compression": 1.0, "vsan_max_drives": 24, "vsan_raid": VSAN_AUTO, "vsan_src_policy": "RAID-1 mirror, FTT=1 (OSA or ESA) · 2x",
     "cmp_view": "Both", "preview_view": "Consolidated", "upload_mode": "Add to active project", "raw_view": "VMs", "raw_cols": "Key columns", "raw_search": "",
 }
 PARAM_KEYS = ["hypervisor", "cpu_model", "sockets", "cores", "ram", "clock", "lo_basis", "vcpu_ratio", "cpu_buffer", "ram_buffer",
               "min_hosts", "ha_nodes", "override", "override_hosts", "override_future",
-              "include_off", "power_scope", "years", "customer"]
+              "include_off", "power_scope", "years", "customer", "sto_free_pct", "snap_old_days",
+              "vsan_show", "vsan_pick", "vsan_compression", "vsan_max_drives", "vsan_raid", "vsan_src_policy"]
 
 KEY_COLUMNS = {
     "RVTools": {"VMs": ["VM", "Powerstate", "Cluster", "Host", "CPUs", "Memory", "Provisioned MiB", "In Use MiB",
@@ -2052,6 +3028,9 @@ def entry_sources(entry):
 def source_data(src):
     """(type, sheets) for one source; type is None if the file isn't a recognised export."""
     if src.get("sheets") is not None:
+        if not src.get("_standalone"):         # projects saved before 3.13
+            src["sheets"] = fill_standalone(src["type"], src["sheets"])
+            src["_standalone"] = True
         return src["type"], src["sheets"]
     stype, sheets = load_workbook(src["bytes"])
     src["type"] = stype
@@ -2221,6 +3200,7 @@ def merge_inventories(parts):
         "storage": {"cap": sum(x["cap"] for x in stor), "used": sum(x["used"] for x in stor),
                     "free": sum(x["free"] for x in stor), "note": " | ".join(notes)},
         **{k: sum(i[k] for i in invs) for k in ("vm_prov_tb", "vm_used_tb", "guest_used_tb", "rdm_cnt", "rdm_tb")},
+        "sto": combine_storage([i["sto"] for i in invs if i.get("sto")]),
         "has_perf": has_perf, "perf_ghz": sum(i["perf_ghz"] for i in invs) if has_perf else 0.0,
         "perf_estimated": any(i["perf_estimated"] for i in invs),
         "perf_paired": [x for i in invs for x in i.get("perf_paired", [])],
@@ -2704,7 +3684,9 @@ def scope_bar(ctx):
     ss = st.session_state
     inactive = ctx.get("inactive", set())
     help_txt = ("None selected = all clusters. Pick several clusters to model a consolidation. "
-                "Clusters marked 'out of scope' are left out of every sizing and report.")
+                "Clusters marked 'out of scope' are left out of every sizing and report."
+                + (f" '{STANDALONE}' groups the ESXi hosts in an export that aren't in a cluster, with their VMs."
+                   if any(c.endswith(STANDALONE) for c in ctx["clusters"]) else ""))
     fmt = lambda c: f"{c} · out of scope" if c in inactive else c  # noqa: E731
     if len(ctx["clusters"]) <= 20:
         st.pills("Cluster scope", ctx["clusters"], selection_mode="multi", key="scope", help=help_txt, format_func=fmt)
@@ -3473,6 +4455,69 @@ def page_environment():
             with col, st.container(border=True):
                 st.markdown(f"#### {title}")
                 st.html(kv_html(rows))
+    render_storage(r)
+
+
+def render_storage(r):
+    s = r["sto"]
+    section_title("What the data occupies", "Storage consumption")
+    if s.get("vsan_src"):
+        st.markdown(":blue-badge[:material/storage: vSAN detected] " + vsan_detect_text(r)
+                    + (" Change this under Sizing parameters > Storage." if s.get("vsan_copies_in_vm") else ""))
+    st.caption(storage_lede(r))
+    t, req = s["totals"], s["required"]["inuse"]
+    c = st.columns(4)
+    snaps = s["has_snap"] and s["snap_cnt"] > 0
+    c[0].metric("In use today", fmt_cap(t["inuse"]["with"]), border=True,
+                help=(f"Without snapshots: {fmt_cap(t['inuse']['without'])}" if snaps else
+                      "What the VMs and templates occupy on the datastores"))
+    c[1].metric("Allocated", fmt_cap(t["alloc"]["with"]), border=True, help="Full provisioned size of every disk")
+    c[2].metric("Snapshots", fmt_cap(s["snap_mb"]) if s["has_snap"] else "Not in export", border=True,
+                help=(f"{s['snap_cnt']:,} snapshots on {s['snap_vms']:,} VMs" if s["has_snap"] else
+                      "This export has no snapshot data"))
+    c[3].metric(f"Effective required · {r['years']} yr", fmt_cap(req["with"][1]), border=True,
+                help=f"In use, {r['growth'] * 100:.0f}% growth a year, {s['free_pct']:.0f}% free. Day 1: "
+                     f"{fmt_cap(req['with'][0])}." + (f" Without snapshots: {fmt_cap(req['without'][1])}." if snaps else ""))
+    if s["snap_old_cnt"]:
+        st.markdown(f":orange-badge[:material/history: {s['snap_old_cnt']:,} snapshots older than {s['old_days']} days] "
+                    f"{fmt_cap(s['snap_old_mb'])}, oldest {s['snap_oldest']:,} days. They may be unintentional; "
+                    "compare the *Without old snapshots* column.")
+    consumed, required = storage_tables_html(r, table_class="hs-cmp sto", hl_class="hs-hl")
+    with st.container(border=True):
+        st.html(consumed)
+    with st.container(border=True):
+        st.html(required)
+    with st.container(border=True):
+        st.html(kv_html([(k, v, False) for k, v in storage_facts(r)]))
+    st.caption(STORAGE_NOTE + "".join(f" {n}." for n in s["notes"])
+               + " Free space and the snapshot age limit are under Sizing parameters > Storage.")
+    render_rdm(r)
+
+
+def render_rdm(r):
+    x, s = r["rdm"], r["sto"]
+    section_title("Migration check", "Raw device mappings")
+    text = rdm_flag_text(r)
+    if text:
+        st.markdown(f":orange-badge[:material/link: RDMs found] {text}")
+    else:
+        st.caption("No raw device mappings were found for the VMs in scope"
+                   + ("" if x["luns"] is not None else " (host LUN data, RVTools vMultiPath, isn't in this export)") + ".")
+    c = st.columns(4)
+    c[0].metric("RDM disks", f"{x['count']:,}", border=True, help=f"On {x['vms']:,} VMs")
+    c[1].metric("Physical / virtual", f"{x['physical']:,} / {x['virtual']:,}", border=True)
+    c[2].metric("Shared RDMs", f"{x['shared']:,}", border=True, help="Multi-writer or SCSI bus sharing (e.g. WSFC)")
+    c[3].metric("Host LUNs not datastores", x["luns"] if x["luns"] is not None else "n/a", border=True,
+                help=f"{x['luns_unmatched']:,} not matched to an RDM in scope")
+    rd, luns = s.get("rdms"), s.get("host_luns")
+    if rd is not None and len(rd):
+        view = rd.assign(**{"Size": rd["Size (MB)"].map(fmt_cap)}).drop(columns=["Size (MB)"])
+        st.dataframe(view[["VM", "Disk", "Size", "Mode", "Sharing", "Host", "Cluster", "LUN ID"]], hide_index=True,
+                     width="stretch")
+    if luns is not None and len(luns):
+        st.dataframe(luns.rename(columns={"Name": "Host LUN (not a datastore)", "LUN": "Device"}), hide_index=True,
+                     width="stretch")
+    st.caption(RDM_NOTE)
 
 
 def _apply_hv_ratio():
@@ -3528,9 +4573,9 @@ def render_parameters(ctx):
         st.markdown("#### Sizing parameters")
         st.caption(f"These settings apply to **{scope_key(st.session_state.scope)}** only. Each cluster selection "
                    "keeps its own settings; a new selection starts from the last one you used.")
-        t0, t1, t2, t3, t4 = st.tabs([":material/layers: Hypervisor", ":material/memory: Target hardware",
-                                      ":material/rule: Constraints", ":material/lock: Host count override",
-                                      ":material/trending_up: Scope & growth"])
+        t0, t1, t2, t3, t4, t5 = st.tabs([":material/layers: Hypervisor", ":material/memory: Target hardware",
+                                          ":material/rule: Constraints", ":material/lock: Host count override",
+                                          ":material/trending_up: Scope & growth", ":material/storage: Storage"])
         with t0:
             st.segmented_control("Target hypervisor", list(HYPERVISORS), key="hypervisor", on_change=_apply_hv_ratio,
                                  width=seg_width(HYPERVISORS),
@@ -3619,6 +4664,40 @@ def render_parameters(ctx):
                                  help="All VMs, only powered-on VMs, or only powered-off VMs (use this to size a DR "
                                       "environment). Suspended VMs count as powered off. Live Optics performance "
                                       "sizing isn't available for powered-off only.")
+        with t5:
+            c = st.columns(2)
+            c[0].number_input("Storage free space (%)", 0.0, 90.0, step=5.0, key="sto_free_pct",
+                              help="Capacity kept free on new array storage. Effective capacity = consumed x growth / "
+                                   "(1 - free space). vSAN uses its reserves instead (except 2-host clusters).")
+            c[1].number_input("Old snapshot age (days)", 1, 3650, key="snap_old_days",
+                              help="Snapshots older than this are flagged as possibly unintentional and shown in the "
+                                   "'Without old snapshots' column.")
+            ss = st.session_state
+            ss.vsan_src_policy = VSAN_SRC_LEGACY.get(ss.get("vsan_src_policy"), ss.get("vsan_src_policy"))
+            if ss.vsan_src_policy not in VSAN_SRC_POLICIES:
+                ss.vsan_src_policy = DEFAULTS["vsan_src_policy"]
+            if ss.get("vsan_raid") not in [VSAN_AUTO] + list(VSAN_POLICIES):
+                ss.vsan_raid = VSAN_AUTO
+            st.toggle("Show vSAN options", key="vsan_show",
+                      help="Adds a vSAN ESA host storage estimate to the Recommendation page and the reports "
+                           "(VMware targets). vSAN found in the source files is always reported.")
+            if not ss.vsan_show:
+                st.caption("Turn on to estimate vSAN ESA drives per host for this sizing.")
+            else:
+                c = st.columns(3)
+                c[0].selectbox("New cluster protection (vSAN ESA)", [VSAN_AUTO] + list(VSAN_POLICIES), key="vsan_raid",
+                               help="Auto picks by host count: 2 hosts RAID-1 mirror, 3-5 hosts RAID-5 2+1, 6+ hosts "
+                                    "RAID-6 4+2. RAID-5 4+1 (6+ hosts) is the FTT=1 alternative for larger clusters.")
+                c[1].number_input("Compression ratio", 1.0, 3.0, step=0.1, key="vsan_compression",
+                                  help="1.0 = no data-reduction credit. Broadcom's sizer often uses 1.2.")
+                c[2].number_input("Max drives per host", VSAN_MIN_DRIVES, 40, key="vsan_max_drives",
+                                  help="Chassis limit for capacity drives.")
+            sto = (ctx.get("r") or {}).get("sto") or {}
+            if sto.get("vsan_src") and sto.get("vsan_copies_in_vm"):
+                st.selectbox("Current environment: vSAN policy today", list(VSAN_SRC_POLICIES), key="vsan_src_policy",
+                             help="RVTools counts a VM's usage on vSAN including its protection copies (e.g. a 100 GB "
+                                  "VM on RAID-1 shows 200 GB). Pick today's policy so the new storage is sized on the "
+                                  "data itself. 'No adjustment' keeps the usage as reported.")
 
 
 def host_card(r, which):
@@ -3643,6 +4722,39 @@ def host_card(r, which):
         if over_hv(r, all_r) or over_hv(r, fo_r):
             st.markdown(f":red-badge[:material/warning: Above {hv_label(r)}]")
         render_checks(r["checks_now"] if now else r["checks_fut"])
+
+
+def render_vsan(r):
+    v = r["vsan"]
+    section_title("If storage moves to vSAN", "vSAN ESA host storage estimate")
+    st.caption(vsan_lede(r, v))
+    if v.get("error"):
+        return
+    best = v["chosen"]
+    c = st.columns(4)
+    c[0].metric("Hosts · policy", f"{v['hosts']} · {v['policy'].split(' (')[0]}", border=True, help=v["policy"])
+    c[1].metric("Effective needed", f"{v['target_fut']:,.2f} TB", border=True,
+                help=f"Day 1 need: {v['target_now']:,.2f} TB")
+    c[2].metric("In report / host", f"{best['fit']['drives']} x {best['size']:g} TB" if best else "None", border=True)
+    c[3].metric("Effective provided", f"{best['fit']['effective']:,.2f} TB" if best else "n/a", border=True,
+                help=(f"Raw {best['fit']['raw']:,.2f} TB" if best else None))
+    options, breakdown = vsan_tables_html(r, v, table_class="hs-cmp sto", hl_class="hs-hl")
+    with st.container(border=True):
+        st.markdown(":gray-badge[:material/visibility_off: Only in the app] Compare the options; the report shows "
+                    "only the configuration you choose below.")
+        st.html(options)
+        st.caption(vsan_options_note(v))
+        opts = vsan_pick_options(v)
+        ss = st.session_state
+        if ss.get("vsan_pick") not in opts:
+            ss.vsan_pick = VSAN_PICK_AUTO
+        st.selectbox("Configuration for the report", opts, key="vsan_pick", format_func=lambda x: vsan_pick_text(v, x),
+                     help="The customer report shows only this configuration and its capacity breakdown. "
+                          "Closest fit = least raw capacity that meets the need.")
+    if breakdown:
+        with st.container(border=True):
+            st.html(breakdown)
+    st.caption(VSAN_NOTE + f" Compression {v['compression']:.2f}x; up to {v['max_drives']} drives per host.")
 
 
 def page_recommendation():
@@ -3770,6 +4882,12 @@ def page_recommendation():
     c[2].metric("Net change", f"{r['lic_diff']:+,} cores", border=True)
     st.caption(f"Edition: {r['lic_edition']} · ESXi: {r['esxi_version']} · "
                f"{LIC_MIN_CORES_PER_SOCKET}-core per CPU minimum applied")
+
+    if r["hypervisor"] == "VMware" and r.get("vsan_show"):
+        render_vsan(r)
+    elif r["sto"].get("vsan_src"):
+        st.caption(":material/storage: vSAN was found in the current environment. Turn on **Show vSAN options** under "
+                   "Sizing parameters > Storage to estimate a vSAN host configuration.")
 
     ins = perf_insight(r)
     if ins:
