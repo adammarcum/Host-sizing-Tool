@@ -1,7 +1,7 @@
-# 📊 Virtualization Sizing Calculator (v3.13)
+# 📊 Virtualization Sizing Calculator (v3.14)
 
 **Authors:** Adam Marcum & Gemini
-**Version:** 3.13
+**Version:** 3.14
 
 A unified infrastructure sizing tool designed for Solutions Architects. It ingests data from **RVTools** or **Dell Live Optics**, performs the sizing math (N+HA, growth, RAM/CPU constraints, licensing) and generates a self-contained HTML executive summary.
 
@@ -112,6 +112,14 @@ The sizing math lives in `compute_sizing()` and has no Streamlit dependencies, s
 * **Scope:** One, several (consolidation), or all clusters; size all VMs, powered-on only, or powered-off only (DR).
 
 ## 📝 Changelog
+
+**3.14**
+* **Recommended host configuration.** For each cluster selection the app picks the best current-generation host (Intel Xeon 6; AMD EPYC 9005 is also considered only when the current hosts already run AMD; otherwise choose AMD manually in the Processor list). **Dual-socket** by default; single-socket only for small clusters (16 cores or fewer per host and 3 hosts or fewer). RAM uses only **balanced memory layouts** (from the Cisco UCS Intel M8 Memory Guide for Xeon 6): every CPU populated identically, all 8 channels (12 on Xeon 6900P / EPYC) filled with 1 or 2 DIMMs per channel, current DIMM sizes 16-256 GB (16 GB 1DPC only; end-of-sale 48 GB left out). On a 2-socket Xeon 6 that means 256, 512, 1,024, 1,536, 2,048, 3,072 or 4,096 GB (no 768 GB), and the recommendation shows the DIMM layout, e.g. *16 x 64 GB DIMMs (1 per channel)*. Dell PowerEdge (R670/R770) and HPE ProLiant Gen12 use the same Xeon 6 memory design (8 channels, 1-2 DIMMs per channel, 16-256 GB DDR5 RDIMMs), so Cisco's rules are the guideline. You can always enter any RAM size manually; Target hardware then shows **Balanced** (with the DIMM layout), a yellow **Unbalanced memory** note for layouts Cisco and Dell support but that leave channels unevenly populated (e.g. 768 GB on 2 sockets = 24 x 32 GB, 12 per CPU: lower bandwidth, not recommended), or an orange **Memory layout not supported** warning with the balanced sizes for that CPU. The Recommendation page's Target hardware card shows the memory layout status, using the same design limit, overhead, HA, minimum cluster and measured CPU as the sizing. Priorities, in order:
+    1. **Stay within today's licensed cores.** If no configuration can, it allows up to 10% more than the fewest licensed cores possible, so the host count stays sensible, and says how many cores would be added.
+    2. **The largest VM fits one socket** (NUMA), when possible.
+    3. **Fewest Day 1 hosts.**
+    4. **Least total RAM**, because memory is most of the server cost. Then fewest licensed cores, the most cores for that licence, and the highest clock.
+* A new cluster selection now **starts on the recommended configuration** (instead of copying the last one used). Target hardware shows a **Recommended configuration** badge with the reasoning; change any CPU, socket or RAM setting to override (*Custom configuration*), and **Use recommended** restores it. Saved selections and projects keep their settings. The report's Target node card shows *Recommended configuration* when it's in use. Last-generation CPUs stay available in the Processor list.
 
 **3.13**
 * **Simpler storage reporting.** The Inventory detail card is now *Datastores* (capacity, used, free, vSAN yes/no, RDM count, scope) and no longer repeats VM figures, which are only under *Storage consumption*. The consumption table shows only the rows that apply (snapshots, templates, RDMs and other files appear when present); snapshot columns and the *without snapshots* totals appear only when the export has snapshots. Scope notes and the vSAN summary use plain wording.

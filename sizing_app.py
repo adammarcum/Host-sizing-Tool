@@ -33,7 +33,7 @@ import streamlit.components.v1 as components
 # 1. CONSTANTS
 # =============================================================================
 APP_TITLE = "Virtualization Sizing Calculator"
-APP_VERSION = "3.13"
+APP_VERSION = "3.14"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo.png")          # navy, light backgrounds
 WHITE_LOGO_PATH = os.path.join(APP_DIR, "ahead_logo_white.png")      # reversed, dark backgrounds
@@ -1739,6 +1739,155 @@ def capacity_checks(r, hosts, vcpu, ram, calc_hosts, ghz=0.0):
     return out
 
 
+# ---------- recommended host configuration (3.14) ----------
+REC_GENS = ("Xeon 6 (Granite Rapids)",)      # current-generation Intel; AMD is chosen manually...
+REC_GENS_AMD = ("EPYC 9005 (Turin)",)         # ...unless the current hosts already run AMD
+REC_LIC_TOLERANCE = 0.10        # when licensing can't be kept, allow 10% over the fewest licensed cores possible
+
+
+REC_1S_MAX_CORES, REC_1S_MAX_HOSTS = 16, 3   # single-socket only for small clusters
+
+# Memory population (Cisco UCS Intel M8 Memory Guide, Intel Xeon 6): every CPU populated identically, every
+# channel filled evenly with 1 or 2 DIMMs per channel (1DPC / 2DPC). 16 GB DIMMs are 1DPC only; 48 GB is
+# end-of-sale and left out. 12-channel CPUs (Xeon 6900P) are treated as 1DPC.
+DIMM_SIZES = [16, 32, 64, 96, 128, 256]
+
+
+def memory_channels(cpu):
+    if cpu is None:
+        return 8, (1, 2)
+    if cpu["vendor"] == "AMD":
+        return 12, (1, 2)
+    return (12, (1,)) if cpu.get("note") == "6900P" else (8, (1, 2))
+
+
+def ram_layouts(cpu, sockets, ram_gb):
+    """Balanced DIMM layouts that give exactly ram_gb per host: [(dimm GB, DIMMs per CPU, DPC)], best first
+    (1DPC first: full memory speed; then fewer, larger DIMMs)."""
+    ch, dpcs = memory_channels(cpu)
+    out = []
+    for dpc in dpcs:
+        for size in DIMM_SIZES:
+            if size == 16 and dpc == 2:
+                continue
+            if sockets * ch * dpc * size == ram_gb:
+                out.append((size, ch * dpc, dpc))
+    return out
+
+
+# Supported-but-unbalanced Xeon 6 counts (Cisco M8 guide; Dell R670/R770 also list 4 and 12 DIMMs per CPU):
+# not every channel populated, or channels populated unevenly, so memory bandwidth is lower.
+PARTIAL_DIMMS_PER_CPU = {32: (4, 12), 64: (4,)}
+
+
+MEM_LEVEL_TEXT = {"ok": "Balanced", "partial": "Unbalanced (supported, lower bandwidth)",
+                  "bad": "Not a supported layout"}
+
+
+def ram_check(cpu, sockets, ram_gb):
+    """('ok' | 'partial' | 'bad', message) for a RAM size on a CPU. Rules follow the Cisco UCS Intel M8 memory
+    guide (Dell PowerEdge and HPE ProLiant Gen12 Xeon 6 servers use the same 8-channel, 1-2 DIMMs-per-channel
+    design, 16-256 GB DDR5 RDIMMs); OEM-specific rules can be stricter."""
+    ch = memory_channels(cpu)[0]
+    lay = ram_layouts(cpu, sockets, ram_gb)
+    if lay:
+        return "ok", f"Memory: {layout_text(lay[0], sockets)}, all {ch} channels per CPU populated evenly."
+    if ch == 8:
+        for size, counts in PARTIAL_DIMMS_PER_CPU.items():
+            for n in counts:
+                if sockets * n * size == ram_gb:
+                    return "partial", (f"{ram_gb:,} GB needs {n * sockets} x {size} GB DIMMs ({n} per CPU on {ch} channels), so "
+                                       "channels are populated unevenly. Cisco and Dell support it, but memory bandwidth is "
+                                       "lower and some OEM configurators reject it. Not recommended.")
+    good = ", ".join(f"{x:,} GB" for x in RAM_OPTIONS if ram_layouts(cpu, sockets, x))
+    return "bad", (f"{ram_gb:,} GB can't be built from one DIMM size with every CPU populated identically "
+                   f"({sockets} socket{'s' if sockets != 1 else ''} x {ch} channels, 1 or 2 DIMMs per channel). "
+                   f"Balanced sizes: {good}. Check the OEM's population rules before quoting it.")
+
+
+def layout_text(layout, sockets):
+    size, per_cpu, dpc = layout
+    return f"{per_cpu * sockets} x {size} GB DIMMs ({dpc} per channel)"
+
+
+def _rec_hosts(vcpu, ram, ghz, cores, clock, ram_gb, p):
+    eff_c = cores * (1 - p["cpu_buffer"] / 100)
+    eff_m = ram_gb * (1 - p["ram_buffer"] / 100)
+    eff_g = cores * clock * (1 - p["cpu_buffer"] / 100) * PERF_TARGET_UTIL
+    need = max(ceil_div(vcpu / p["vcpu_ratio"], eff_c), ceil_div(ram, eff_m), ceil_div(ghz, eff_g) if ghz else 0)
+    return max(need + p["ha_nodes"], p["min_hosts"])
+
+
+def recommend_hardware(r, p):
+    """Best current-generation host for this workload. Priorities: 1) stay within today's licensed cores, or
+    when nothing can, add the fewest, 2) largest VM fits one socket (NUMA), 3) fewest Day 1 hosts, 4) least total
+    RAM (the main server cost), then fewest licensed cores, the most cores for that licence and the highest clock."""
+    vcpu, ram = r["tot_vcpu"], r["tot_ram"]
+    ghz = r["perf_ghz"] if r["has_perf"] else 0.0
+    if vcpu <= 0 and ram <= 0:
+        return None
+    cap = int(r.get("cur_lic_cores") or 0)
+    gens = REC_GENS + (REC_GENS_AMD if r.get("cur_amd") else ())
+    cands = []
+    for c in CPU_CATALOG:
+        if c["gen"] not in gens:
+            continue
+        for sockets in (2, 1):
+            if sockets > c["max_sockets"] or (sockets == 1 and c["cores"] > REC_1S_MAX_CORES):
+                continue
+            host_cores = sockets * c["cores"]
+            for ram_gb in RAM_OPTIONS:
+                layouts = ram_layouts(c, sockets, ram_gb)
+                if not layouts:                  # can't be populated evenly on this CPU
+                    continue
+                hosts = _rec_hosts(vcpu, ram, ghz, host_cores, c["ghz"], ram_gb, p)
+                if sockets == 1 and hosts > REC_1S_MAX_HOSTS:
+                    continue
+                lic = hosts * license_cores_per_host(sockets, c["cores"])
+                numa = r["max_vm_cpu"] <= c["cores"] and r["max_vm_ram"] <= ram_gb / sockets
+                over = cap > 0 and lic > cap
+                cands.append(((not numa, hosts, hosts * ram_gb, lic, -host_cores, -c["ghz"], -sockets),
+                              {"cpu": c, "sockets": sockets, "ram": ram_gb, "hosts": hosts, "lic": lic,
+                               "within_lic": not over, "numa": numa, "layout": layouts[0]}))
+    if not cands:
+        return None
+    # Licensing: keep to today's licensed cores when any configuration can; otherwise allow up to 10% more
+    # than the fewest licensed cores possible, so the host count stays sensible.
+    within = [x for x in cands if x[1]["within_lic"]]
+    if within:
+        pool = within
+    else:
+        low = min(x[1]["lic"] for x in cands)
+        pool = [x for x in cands if x[1]["lic"] <= low * (1 + REC_LIC_TOLERANCE)]
+    any_within = bool(within)
+    cands = sorted(pool, key=lambda x: x[0]) + sorted([x for x in cands if x not in pool], key=lambda x: x[0])
+    best = dict(cands[0][1])
+    c = best["cpu"]
+    best.update(label=c["label"], cores=c["cores"], clock=float(c["ghz"]), cap=cap,
+                hosts_fut=_rec_hosts(r["fut_vcpu"], r["fut_ram"], r.get("fut_ghz", 0.0) if r["has_perf"] else 0.0,
+                                     best["sockets"] * c["cores"], c["ghz"], best["ram"], p),
+                any_within=any_within, extra=max(best["lic"] - cap, 0) if cap else 0)
+    best["alt"] = None
+    best["amd_allowed"] = bool(r.get("cur_amd"))
+    return best
+
+
+def rec_text(rec, r=None):
+    """One-line description of a recommended configuration."""
+    c = rec["cpu"]
+    lic = (f"{rec['lic']:,} licensed cores (today {rec['cap']:,})" if rec["cap"] else f"{rec['lic']:,} licensed cores")
+    return (f"{rec['sockets']} x {c['name']} ({c['cores']} cores, {c['ghz']:.2f} GHz) with {rec['ram']:,} GB RAM "
+            f"({layout_text(rec['layout'], rec['sockets'])}): "
+            f"{rec['hosts']} hosts Day 1, {rec['hosts_fut']} future, {lic}")
+
+
+def is_recommended(r):
+    rec = r.get("hw_rec")
+    return bool(rec) and (r.get("cpu_model") == rec["label"] and int(r["sockets"]) == rec["sockets"]
+                          and int(r["cores"]) == rec["cores"] and round(float(r["clock"]), 2) == round(rec["clock"], 2)
+                          and int(r["ram"]) == rec["ram"])
+
+
 def compute_sizing(inv, p):
     """inv: inventory dict from a parser. p: parameter dict from the sidebar.
     Returns one flat results dict used by BOTH the on-screen view and the HTML report."""
@@ -1836,6 +1985,10 @@ def compute_sizing(inv, p):
     r["lic_diff"] = r["fut_lic_cores"] - r["cur_lic_cores"]
     r["vsan"] = vsan_estimate(r)
     r["rdm"] = rdm_summary(r["sto"])
+    models = inv["hosts"]["model"].astype(str) if "model" in inv["hosts"].columns else pd.Series(dtype=str)
+    r["cur_amd"] = bool(models.str.contains(r"\bAMD\b|EPYC", case=False, regex=True, na=False).any())
+    r["hw_rec"] = recommend_hardware(r, p)
+    r["hw_is_rec"] = is_recommended(r)
     return r
 
 
@@ -2280,7 +2433,7 @@ def generate_html_report(r, customer_logo_uri=None):
     panel_cards = [
         ("Target node", f"{r['host_cores']} cores · {r['ram']:,} GB",
          f"{host_cpu_text(r)}. {r['cpu_buffer']}% CPU and {r['ram_buffer']}% RAM reserved for overhead.",
-         pill(True, "Design input", "info")),
+         pill(True, "Recommended configuration") if r.get("hw_is_rec") else pill(True, "Design input", "info")),
         ("CPU", f"{d['cpu_ratio']:.1f}:1 at failover",
          f"vCPU per usable core with {plural(r['ha_nodes'], 'host')} down. Design limit {r['vcpu_ratio']:.1f}:1; "
          f"{r['hypervisor']} {r['hv_kind']} {r['hv_ratio']:.1f}:1 (vCPU:pCPU at failover {fmt_ratio(r['ratio_now_failover'])}).",
@@ -3542,6 +3695,11 @@ def build_context():
     try:
         inv, stype, files = parse_entry(entry, scope, p)
         r = compute_sizing(inv, p)
+        if ss.pop("_apply_rec", None) == scope_key(ss.scope) and r.get("hw_rec") and not r["hw_is_rec"]:
+            apply_rec(r["hw_rec"])
+            entry.setdefault("scope_settings", {})[scope_key(ss.scope)] = sizing_snapshot()
+            p = params_from_state()
+            r = compute_sizing(inv, p)
         r.update(scope_label=scope_label, file_name=files, source_type=stype,
                  workload_label=scope_label_text(entry, scope))
         html = generate_html_report(r, customer_logo_uri())
@@ -3814,6 +3972,8 @@ def sync_scope_settings(entry_name, entry):
     if ss.get("_scope_for") != (entry_name, key):
         if key in store:
             load_sizing(store[key])
+        else:
+            ss._apply_rec = key            # first time this selection is sized: start on the recommendation
         ss._scope_for = (entry_name, key)
     elif key in store and store[key] != sizing_snapshot() and key not in entry.setdefault("touched", []):
         entry["touched"].append(key)       # the user changed a setting on this selection
@@ -4549,6 +4709,46 @@ def _ram_entered():
     ss._ram_ok = val
 
 
+def apply_rec(rec):
+    ss = st.session_state
+    ss.cpu_model, ss.sockets, ss.cores = rec["label"], rec["sockets"], rec["cores"]
+    ss.clock, ss.ram = rec["clock"], rec["ram"]
+
+
+def _use_recommended(rec):
+    apply_rec(rec)
+    flash("success", "Target hardware set to the recommended configuration.")
+
+
+def render_recommendation_box(r):
+    rec = r.get("hw_rec")
+    if not rec:
+        return
+    with st.container(border=True):
+        if r.get("hw_is_rec"):
+            st.markdown(":green-badge[:material/verified: Recommended configuration] " + rec_text(rec))
+        else:
+            c = st.columns([3, 1], vertical_alignment="center")
+            c[0].markdown(":gray-badge[:material/tune: Custom configuration] Recommended: " + rec_text(rec))
+            c[1].button("Use recommended", icon=":material/verified:", on_click=_use_recommended, args=(rec,),
+                        width="stretch", key="use_rec")
+        why = ["current-generation Intel Xeon 6 and AMD EPYC 9005, as the current hosts run AMD" if rec.get("amd_allowed")
+               else "current-generation Intel Xeon 6 only (pick AMD in the Processor list if preferred)",
+               "stays within today's licensed cores" if rec["within_lic"] else
+               (f"no configuration stays within today's licensed cores, so this one adds {rec['extra']:,} "
+                 "(within 10% of the fewest possible)" if rec["cap"] else "current licensing not in the export"),
+               "the largest VM fits one socket" if rec["numa"] else "the largest VM is wider than any socket",
+               "dual-socket hosts (single-socket only for clusters of up to 3 hosts with 16 cores or fewer)",
+               "memory populated evenly on every channel (1 or 2 DIMMs per channel, identical on each CPU)",
+               "then the fewest Day 1 hosts and the least total RAM (RAM is most of the server cost)"]
+        alt = rec.get("alt")
+        st.caption("Picked from " + "; ".join(why) + "."
+                   + (f" Best {alt['cpu']['vendor']} option: {alt['sockets']} x {alt['cpu']['name']} "
+                      f"({alt['cpu']['cores']}c), {alt['ram']:,} GB, {alt['hosts']} hosts, {alt['lic']:,} licensed cores."
+                      if alt else "")
+                   + " Change any CPU, socket or RAM setting to override.")
+
+
 def _apply_cpu():
     """Processor picked: copy its cores per socket and base GHz into Target hardware."""
     ss = st.session_state
@@ -4599,6 +4799,7 @@ def render_parameters(ctx):
                                           columns=["Hypervisor", "vCPU:pCPU", "Type"]),
                              hide_index=True, width="stretch")
         with t1:
+            render_recommendation_box(ctx["r"])
             ss = st.session_state
             if ss.get("cpu_model") not in CPU_BY_LABEL:
                 ss.cpu_model = CPU_CUSTOM
@@ -4622,9 +4823,13 @@ def render_parameters(ctx):
                                 f"({RAM_MIN:,}-{RAM_MAX:,} GB) and press Enter to use it.")
             c[3].number_input("CPU speed (GHz)", 1.0, 5.0, key="clock", format="%.2f", on_change=_cpu_edited,
                               help="Base clock per core. Used for measured CPU (Live Optics) sizing.")
-            if int(ss.ram) % 256:
-                st.markdown(f":orange-badge[:material/warning: {int(ss.ram):,} GB isn't a multiple of 256 GB] "
-                            "Current servers fill every memory channel evenly; check the DIMM layout supports it.")
+            level, msg = ram_check(cpu, int(ss.sockets), int(ss.ram))
+            if level == "bad":
+                st.markdown(":orange-badge[:material/warning: Memory layout not supported] " + msg)
+            elif level == "partial":
+                st.markdown(":yellow-badge[:material/info: Unbalanced memory] " + msg)
+            else:
+                st.caption(msg)
             if cpu:
                 st.caption(f"**{cpu['name']}**: {cpu['cores']} cores per socket, {cpu['ghz']:.2f} GHz base, "
                            f"up to {cpu['max_sockets']} socket{'' if cpu['max_sockets'] == 1 else 's'}"
@@ -4783,7 +4988,8 @@ def page_recommendation():
     d = r["design_now"]
     cards = [
         ("Target node", f"{r['host_cores']}", "cores", f"{r['ram']:,} GB RAM · {r['cpu_buffer']}% CPU / "
-         f"{r['ram_buffer']}% RAM overhead", badge_md(True, "Design input", "", neutral=True)),
+         f"{r['ram_buffer']}% RAM overhead", badge_md(True, "Recommended configuration", "") if r.get("hw_is_rec")
+         else badge_md(True, "Design input", "", neutral=True)),
         ("CPU at failover", f"{d['cpu_ratio']:.1f}:1", "vCPU / core",
          f"Design limit {r['vcpu_ratio']:.1f}:1 · {hv_label(r)} (failover vCPU:pCPU {fmt_ratio(r['ratio_now_failover'])})",
          badge_md(d["cpu_ok"], "Within limit", "Exceeds limit")
@@ -4842,12 +5048,14 @@ def page_recommendation():
         st.html(f"<table class='hs-cmp'><tr>{head}</tr>{body}</table>")
         st.caption(f"Ratios in bold red are above the {hv_label(r)}. {r['hv_note']}")
 
+    mem_level = ram_check(CPU_BY_LABEL.get(r.get("cpu_model") or ""), int(r["sockets"]), int(r["ram"]))[0]
     c1, c2 = st.columns(2)
     with c1, st.container(border=True, height="stretch"):
         st.markdown("#### Target hardware (per node)")
         st.html(kv_html([
             ("CPU", f"{host_cpu_text(r)} · {r['host_cores']} cores", False),
             ("RAM", f"{r['ram']:,} GB", False),
+            ("Memory layout", MEM_LEVEL_TEXT[mem_level], mem_level != "ok"),
             ("Overhead reserved", f"{r['cpu_buffer']}% CPU, {r['ram_buffer']}% RAM", False),
             ("Hypervisor", f"{r['hypervisor']} ({r['hv_ratio']:.1f}:1 {r['hv_kind']})", False),
             ("Design limit", f"{r['vcpu_ratio']:.1f}:1 vCPU:pCPU", r["vcpu_ratio"] > r["hv_ratio"] + EPS),
